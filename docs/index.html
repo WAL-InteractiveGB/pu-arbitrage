@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PU Arbitrage</title>
+  <meta name="description" content="Find the most profitable cargo runs between Prosperous Universe commodity exchanges, after fuel, gateway fees, slippage and price risk.">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='14' fill='%23f2a33a'/%3E%3Cpath d='M9 19l5-6 4 4 5-7' stroke='%23121820' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/highs@1.15.4/build/highs.js"
+          integrity="sha384-8VF/84lUdwWTmd6C4TlyNI0GCoMmX0iTMuYiSgqm4Q+A36WnVSQAAHMvAGdx71U1"
+          crossorigin="anonymous"></script>
+  <script type="module" src="js/app.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <h1>PU Arbitrage</h1>
+    <p>Profitable cargo runs between Prosperous Universe exchanges, after fuel, gateway fees, slippage and price risk.</p>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button role="tab" data-tab="find" aria-selected="true">Find trades</button>
+    <button role="tab" data-tab="log" aria-selected="false">Trade log <span id="open-count" class="pill" hidden></span></button>
+    <button role="tab" data-tab="about" aria-selected="false">How it works</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ============================== FIND TRADES ============================== -->
+  <section id="tab-find" class="tab">
+    <div class="layout">
+      <form id="setup" class="setup" autocomplete="off">
+        <fieldset class="card">
+          <legend>Ship and cash</legend>
+          <label>Ship is at
+            <select id="home" required><option value="">Loading...</option></select>
+          </label>
+          <label>Cash to trade with
+            <input id="capital" type="number" min="1" step="1000" required>
+            <small>In the currency of that exchange.</small>
+          </label>
+          <div class="row2">
+            <label>Cargo weight (t)
+              <input id="weight" type="number" min="1" step="1" required>
+            </label>
+            <label>Cargo volume (m³)
+              <input id="volume" type="number" min="1" step="1" required>
+            </label>
+          </div>
+          <small>Shown on your ship's cargo hold (the ship's inventory screen).</small>
+          <div class="row2">
+            <label>Hours per jump
+              <input id="hoursPerJump" type="number" min="0" step="0.1" required>
+            </label>
+            <label>Extra hours per leg
+              <input id="overheadHours" type="number" min="0" step="0.5">
+            </label>
+          </div>
+          <label>Max jumps per leg
+            <input id="maxJumps" type="number" min="1" step="1" placeholder="no limit">
+          </label>
+        </fieldset>
+
+        <fieldset class="card">
+          <legend>Fuel</legend>
+          <label>FTL reactor usage (%)
+            <input id="reactor" type="number" min="1" max="100" step="1" required>
+            <small>The FTL slider in the flight planner (SFC). 25% is the cheapest.</small>
+          </label>
+          <label>STL fuel (SF) per flight
+            <input id="sfPerTrip" type="number" min="0" step="1" placeholder="not set">
+            <small>Plan a loaded flight in SFC and copy the SF it needs. Leave empty to ignore SF.</small>
+          </label>
+          <details>
+            <summary>Advanced</summary>
+            <label>FF per parsec at 100% reactor
+              <input id="ffPerParsec" type="number" min="0" step="0.1">
+              <small>Community-derived game constant: 7.2.</small>
+            </label>
+          </details>
+        </fieldset>
+
+        <fieldset class="card">
+          <legend>Gateway fees</legend>
+          <small>Gateway fees are set by the governments that run them and aren't published. Copy the cost SFC shows for each route you fly. One row per direction.</small>
+          <div id="gw-rows" class="gw-rows"></div>
+          <button type="button" id="gw-add" class="ghost">+ Add route fee</button>
+          <label>Flat fee for any other faction-border crossing
+            <input id="flatFee" type="number" min="0" step="100" placeholder="0">
+          </label>
+        </fieldset>
+
+        <fieldset class="card">
+          <legend>Market and risk</legend>
+          <label>Trip types
+            <select id="mode">
+              <option value="both">All (one-way and round trips)</option>
+              <option value="same">One-way, same currency only</option>
+              <option value="cycle">Round trips through other currencies</option>
+            </select>
+          </label>
+          <div class="row2">
+            <label>Exchange fee (%)
+              <input id="feeRate" type="number" min="0" max="50" step="0.05" required>
+            </label>
+            <label>Risk aversion
+              <input id="riskAversion" type="number" min="0" step="0.25" required>
+            </label>
+          </div>
+          <small>Risk aversion: how many standard deviations of price risk to subtract when ranking. 0 ranks by expected profit alone.</small>
+          <label class="check"><input id="roundTrip" type="checkbox"> Count the empty flight home on one-way trips</label>
+          <label class="check"><input id="useHistory" type="checkbox"> Use price history for risk (slower on first run)</label>
+        </fieldset>
+      </form>
+
+      <div class="results">
+        <div class="runbar">
+          <button id="run" class="primary" disabled>Find trades</button>
+          <button id="refresh" class="ghost" title="Download fresh order books">Refresh market data</button>
+          <span id="data-age" class="muted"></span>
+        </div>
+        <div id="status" class="status" role="status" aria-live="polite">Starting...</div>
+        <div class="progress" hidden><div id="bar"></div></div>
+        <div id="warnings"></div>
+        <div id="results-wrap" hidden>
+          <div class="table-scroll">
+            <table id="results" class="data">
+              <thead><tr>
+                <th>#</th><th>Route</th><th>Type</th><th class="n">Hours</th><th class="n">Capital</th>
+                <th class="n">Hold</th><th class="n">Fuel</th><th class="n">Fees</th>
+                <th class="n">Net profit</th><th class="n">Risk (1 sd)</th><th class="n">Score / hr</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <p class="muted small">Amounts are in the currency of the exchange the ship starts at. Net profit is after exchange fees, fuel and gateway fees. Score = (profit − risk aversion × risk) per hour. Click a row for the full plan.</p>
+        </div>
+        <article id="detail" class="card detail" hidden></article>
+        <div id="empty" class="empty">
+          <h2>How to use this</h2>
+          <ol>
+            <li>Pick the exchange your ship is at and how much cash you have.</li>
+            <li>Enter your ship's cargo space and the fuel numbers from the flight planner (SFC).</li>
+            <li>Add any gateway fees you pay, then press <b>Find trades</b>.</li>
+            <li>Before you fly a trade, press <b>Log this trade</b> so you can compare the prediction with what you really make.</li>
+          </ol>
+          <p class="muted">Your settings and trade log stay in this browser. Nothing is sent anywhere except requests for public market data to <a href="https://doc.fnar.net" target="_blank" rel="noopener">FIO</a>.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================== TRADE LOG ============================== -->
+  <section id="tab-log" class="tab" hidden>
+    <div class="card">
+      <h2>Track record</h2>
+      <p class="muted">Each trade is saved with the prediction at the moment you logged it. Close it with what you actually made, and this page shows how accurate the model is.</p>
+      <ul id="log-summary" class="summary"></ul>
+      <div class="table-scroll">
+        <table id="log" class="data">
+          <thead><tr>
+            <th>#</th><th>Opened</th><th>Route</th><th>Type</th><th>Cur</th><th class="n">Predicted</th>
+            <th class="n">Risk 1sd</th><th class="n">Actual</th><th class="n">Error</th><th class="n">Err/sd</th>
+            <th class="n">Hrs</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <p id="log-empty" class="muted">No trades yet. Find a trade, then press <b>Log this trade</b> before you fly it.</p>
+      <div class="buttons">
+        <button id="export-json" class="ghost">Export log (JSON)</button>
+        <button id="export-md" class="ghost">Export track record (Markdown)</button>
+        <label class="ghost filebtn">Import log (JSON)<input id="import-json" type="file" accept=".json,application/json" hidden></label>
+      </div>
+      <p class="muted small">The JSON format is the same as the Python tool's <code>trade_log.json</code>, so you can move logs between them.</p>
+    </div>
+  </section>
+
+  <!-- ============================== ABOUT ============================== -->
+  <section id="tab-about" class="tab" hidden>
+    <div class="card prose">
+      <h2>How it works</h2>
+      <p>Prosperous Universe is a small, self-contained version of physical commodity trading. This tool looks at a cargo the way a commodity trader would: buy where a good is cheap, pay to move it, sell where it is dear, but only if the spread survives every cost and the risk of the price moving while it travels.</p>
+      <h3>1. Real prices, not quotes</h3>
+      <p>It walks each exchange's order book level by level. Buying a lot of something moves you up the ask ladder, and that slippage often kills a spread that looks good on screen. It also assumes only half the bids at the destination will still be there when you arrive, because other players keep trading while you fly.</p>
+      <h3>2. Freight costs</h3>
+      <p>Fuel follows the game's mechanics as worked out by the community. FTL fuel = parsecs flown × 7.2 × reactor usage, using the game's own jump routes. STL fuel is a roughly fixed amount per flight that you measure in SFC. Fuel is priced at the departure exchange's real asks. Gateway fees are deducted in the currency they are paid in.</p>
+      <h3>3. Choosing the cargo</h3>
+      <p>Picking what to load is a knapsack problem with three limits at once: cash, weight and volume. It is solved exactly as an integer program (the HiGHS solver, running in your browser), so the answer is often a mix: a dense, valuable good to use the weight limit plus a light, bulky one to fill the space.</p>
+      <h3>4. Price risk in transit</h3>
+      <p>A cargo is an unhedged position for the whole flight. Volatility is estimated from 30 days of prices and scaled to the flight time. If the destination price is well above its recent average, part of that premium is assumed to fade before you arrive. Trips are ranked by risk-adjusted profit per hour.</p>
+      <h3>5. Trading across currencies</h3>
+      <p>Each faction has its own currency, and the tool assumes you cannot convert between them. A round trip A → B → A is solved as one problem: the return cargo can only be bought with what the first cargo earned at B, profit is measured in your home currency, and cash stranded at B counts as zero.</p>
+      <h3>Limitations</h3>
+      <ul>
+        <li>The exchange fee and the 50% depth assumption are estimates. Adjust them to what you see in game.</li>
+        <li>Price moves of different goods are treated as independent, which understates risk if they move together.</li>
+        <li>The order books are a snapshot. The more players arbitrage the same gaps, the smaller they get. That is good for the game's markets.</li>
+      </ul>
+      <p class="muted">Market and map data from <a href="https://doc.fnar.net" target="_blank" rel="noopener">FIO</a>, a community project. Not affiliated with Simulogics or FIO. Source code and the Python version are on <a id="repo-link" href="https://github.com/WAL-InteractiveGB/pu-arbitrage" target="_blank" rel="noopener">GitHub</a>.</p>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">Built by <a href="https://github.com/Arthur-Pierce" target="_blank" rel="noopener">Arthur Pierce</a> · WAL Interactive · <a href="https://github.com/WAL-InteractiveGB/pu-arbitrage" target="_blank" rel="noopener">Source on GitHub</a> (MIT) · Data: FIO</footer>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "_readme": "Copy to borders.json. The numbers below are PLACEHOLDERS: replace them with the gateway fee the in-game flight planner (SFC) shows for each route you fly. entry_fee is a flat amount in the destination exchange's currency. Routes are one direction each. See borders.py for the other options.",
+
+  "routes": {
+    "CI1>NC1": {"entry_fee": 4500},
+    "NC1>CI1": {"entry_fee": 4500},
+    "CI1>IC1": {"entry_fee": 3000},
+    "IC1>CI1": {"entry_fee": 3000}
+  },
+
+  "default": {
+    "_note": "Optional: a fee for every faction-border crossing not listed in routes.",
+    "entry_fee": 0
+  }
+}

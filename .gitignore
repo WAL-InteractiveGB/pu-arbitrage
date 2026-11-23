@@ -1,0 +1,15 @@
+# Your own setup and data: kept out of the public repo
+ships.json
+flights.csv
+borders.json
+distances.csv
+trade_log.json
+prun.db
+*.csv
+!*.example.csv
+
+# Caches
+.fio_cache/
+__pycache__/
+*.pyc
+.DS_Store

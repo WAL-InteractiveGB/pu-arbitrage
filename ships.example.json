@@ -1,0 +1,13 @@
+{
+  "ships": {
+    "MyHauler": {
+      "cargo_weight": 500.0,
+      "cargo_volume": 500.0,
+      "hours_per_distance": 1.5,
+      "overhead_hours": 0.0,
+      "max_distance": 40,
+      "reactor_usage": 0.25,
+      "sf_per_trip": 457.5
+    }
+  }
+}
