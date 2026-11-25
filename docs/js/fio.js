@@ -134,7 +134,13 @@ export class History {
   }
 
   closes(ticker, ex) {
-    return this.cache.get(`${ticker}.${ex}`) || [];
+    return this.cache.get(`${ticker}.${ex}`)?.c || [];
+  }
+
+  // Average daily units traded over the history window, or null.
+  dailyVolume(ticker, ex) {
+    const v = this.cache.get(`${ticker}.${ex}`)?.v;
+    return v == null ? null : v;
   }
 
   async prefetch(keys) {
@@ -143,9 +149,9 @@ export class History {
     if (!todo.length) return;
     let done = 0;
     await pool(todo, 6, async (key) => {
-      const saved = storeGet(`h:${key}`, 6 * HOUR);
+      const saved = storeGet(`h2:${key}`, 6 * HOUR);
       if (saved !== undefined) { this.cache.set(key, saved); return; }
-      let closes = [];
+      let closes = [], vol = null;
       try {
         let recs = await this.fio.fetchJson(`/exchange/cxpc/${encodeURIComponent(key)}`);
         recs = Array.isArray(recs) ? recs.filter((r) => r && typeof r === "object") : [];
@@ -155,9 +161,12 @@ export class History {
         }
         recs.sort((x, y) => (x.DateEpochMs || x.Date || 0) - (y.DateEpochMs || y.Date || 0));
         closes = recs.filter((r) => r.Close != null).map((r) => Number(r.Close)).slice(-C.HISTORY_DAYS);
-      } catch { closes = []; }
-      this.cache.set(key, closes);
-      storeSet(`h:${key}`, closes); // only ~30 numbers, so cheap to keep
+        const traded = recs.filter((r) => r.Traded != null).map((r) => Number(r.Traded)).slice(-C.HISTORY_DAYS);
+        if (traded.length >= C.MIN_HISTORY_POINTS) vol = traded.reduce((a, b) => a + b, 0) / traded.length;
+      } catch { closes = []; vol = null; }
+      const entry = { c: closes, v: vol };
+      this.cache.set(key, entry);
+      storeSet(`h2:${key}`, entry); // ~30 numbers, so cheap to keep
       if (++done % 5 === 0 || done === todo.length) this.onStatus(`Price history ${done}/${todo.length}`);
     });
   }

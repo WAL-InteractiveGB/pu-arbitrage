@@ -76,7 +76,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -84,6 +84,7 @@ import numpy as np
 import requests
 
 from borders import REGION_KEYS, BorderModel, Crossing
+from flightmodel import FlightModel, MeasuredModel, load_model
 from currencies import (CURRENCY_KEYS, normalise, resolve_currencies,
                         same_currency)
 
@@ -99,8 +100,15 @@ except ImportError:  # the greedy fallback is used instead
 BASE = "https://rest.fnar.net"
 DEFAULT_FEE_RATE = 0.01  # exchange fee per trade leg (placeholder, --fee-rate)
 UNLIMITED = 10 ** 9      # quantity used for orders with no stated size
-DEST_DEPTH_SHARE = 0.5   # share of displayed destination bids assumed still
-                         # available when you arrive (others trade while you fly)
+# Order-book depth on arrival. Other players trade while you fly, so part of
+# the bids (or asks) you are counting on will be gone. The share left is
+# exp(-TAKER_SHARE * daily units traded * days in transit / units on the book):
+# the longer the flight and the busier the market relative to its depth, the
+# less is left. Daily volume is the 30-day average with price history, else
+# the last 24 hours from /exchange/full.
+TAKER_SHARE = 0.5        # share of traded volume assumed to hit this side
+MIN_DEPTH_SHARE = 0.1    # never assume less than this is left
+DEST_DEPTH_SHARE = 0.5   # fallback when FIO gives no volume for an item
 MAX_CANDIDATES = 40      # items per route that get a history lookup
 MAX_CANDIDATES_CYCLE = 25  # items per leg of a cycle
 HISTORY_DAYS = 30
@@ -270,6 +278,7 @@ class BookStore:
     def __init__(self, client):
         self.client = client
         self.books, self.currency, self._by_ex = {}, {}, {}
+        self.traded = {}  # (ticker, ex) -> units traded in the last 24 hours
         for rec in client.get("/exchange/full", ttl=300):
             t, ex = rec.get("MaterialTicker"), rec.get("ExchangeCode")
             if not t or not ex:
@@ -278,6 +287,8 @@ class BookStore:
             cur = normalise(pick(rec, *CURRENCY_KEYS))
             if cur:
                 self.currency[ex] = cur
+            if rec.get("Traded") is not None:
+                self.traded[(t, ex)] = float(rec["Traded"])
             if "BuyingOrders" in rec or "SellingOrders" in rec:
                 self.books[(t, ex)] = parse_book(rec)
 
@@ -304,6 +315,7 @@ class History:
 
     def __init__(self, client, db_path="prun.db", enabled=True):
         self.client, self.enabled, self.cache = client, enabled, {}
+        self.volumes = {}  # (ticker, ex) -> daily units traded, from FIO
         self.conn = (sqlite3.connect(db_path, check_same_thread=False)
                      if enabled and os.path.exists(db_path) else None)
         self._db_lock = threading.Lock()
@@ -358,7 +370,14 @@ class History:
             recs = daily or recs
         recs.sort(key=lambda r: pick(r, "DateEpochMs", "Date", "Timestamp") or 0)
         closes = [float(r["Close"]) for r in recs if r.get("Close") is not None]
+        traded = [float(r["Traded"]) for r in recs if r.get("Traded") is not None]
+        if len(traded) >= MIN_HISTORY_POINTS:
+            self.volumes[(ticker, ex)] = statistics.fmean(traded[-HISTORY_DAYS:])
         return closes[-HISTORY_DAYS:]
+
+    def daily_volume(self, ticker, ex):
+        """Average daily units traded, if the history download had volumes."""
+        return self.volumes.get((ticker, ex))
 
 
 @dataclass(frozen=True)
@@ -506,6 +525,31 @@ def slippage(levels, qty):
     if not filled or not levels:
         return float("nan")
     return abs(price / levels[0][0] - 1)
+
+
+def depth_share(levels, daily_units, hours):
+    """Share of the displayed book expected to still be there after `hours`.
+
+    daily_units is how many units of this item change hands per day. Half of
+    that volume (TAKER_SHARE) is assumed to trade against the side you need,
+    spread evenly over the book. Orders with no stated size (market makers) are
+    not counted as depth and are never used up."""
+    if daily_units is None:
+        return DEST_DEPTH_SHARE
+    depth = sum(q for _, q in levels if q < UNLIMITED)
+    if depth <= 0:
+        return 1.0
+    used = TAKER_SHARE * daily_units * hours / 24
+    return max(MIN_DEPTH_SHARE, math.exp(-used / depth))
+
+
+def market_volume(market, ticker, ex):
+    """Daily units traded: 30-day average if loaded, else the last 24 hours."""
+    get = getattr(market.history, "daily_volume", None)
+    vol = get(ticker, ex) if get else None
+    if vol is None:
+        vol = getattr(market.books, "traded", {}).get((ticker, ex))
+    return vol
 
 
 @dataclass
@@ -722,6 +766,14 @@ def optimize_cycle(lots1, lots2, capital, home_upfront, mid_fixed, max_w, max_v,
 #                   take-off and landing, measured per ship in SFC.
 FF_PER_PARSEC = 7.2           # FF per parsec at 100% reactor usage
 DEFAULT_REACTOR_USAGE = 0.25  # the cheapest FTL setting in the flight planner
+# STL fuel, from the community flight-planner research (prun-toolset). A
+# station-to-station flight has two STL phases. The approach burns
+# STL_BURN x STL slider x SF loaded. Departure burns the same, unless the gate
+# is close enough that the ship needs less (depends on distance and mass, which
+# FIO doesn't give us), so STL_DEPARTURE_SHARE = 1 is an upper bound.
+STL_BURN = 0.494
+DEFAULT_STL_USAGE = 0.5       # the flight planner's default STL fuel setting
+STL_DEPARTURE_SHARE = 1.0
 
 
 @dataclass
@@ -731,16 +783,46 @@ class Ship:
     max_distance: float = math.inf   # jumps per leg
     hours_per_distance: float | None = None  # hours per jump
     overhead_hours: float = 0.0
-    sf_per_trip: float | None = None
+    sf_per_trip: float | None = None   # measured SF per flight (overrides the model)
     reactor_usage: float = DEFAULT_REACTOR_USAGE  # fraction, 0.25 = 25%
     ff_per_parsec: float = FF_PER_PARSEC
+    sf_loaded: float | None = None     # SF in the tank at take-off
+    stl_usage: float = DEFAULT_STL_USAGE  # STL fuel slider, fraction
+    stl_departure_share: float = STL_DEPARTURE_SHARE
+    flight_model: FlightModel | MeasuredModel | None = None  # fitted from SFC flights
+    ftl_tank: float | None = None  # FF the tank holds; longer legs are skipped
 
     def ff_units(self, parsecs):
+        if self.flight_model:
+            return self.flight_model.ff(parsecs, self.reactor_usage)
         return parsecs * self.ff_per_parsec * self.reactor_usage
+
+    def leg_hours(self, route):
+        """Flight time from the fitted model, or None without one."""
+        if not self.flight_model or route.parsecs is None:
+            return None
+        return self.flight_model.hours(route.parsecs, route.jumps, self.stl_usage,
+                                       self.reactor_usage, self.sf_loaded or 0)
+
+    @property
+    def settings_label(self):
+        return f"{100 * self.stl_usage:.0f}/{100 * self.reactor_usage:.0f}"
+
+    def sf_units(self):
+        """SF burned on one flight: the measured figure if given, else the
+        game model from the SF loaded and the STL slider."""
+        if self.sf_per_trip is not None:
+            return self.sf_per_trip
+        if self.flight_model and self.sf_loaded:
+            return self.flight_model.sf(self.stl_usage, self.sf_loaded)
+        if not self.sf_loaded:
+            return 0.0
+        approach = STL_BURN * self.stl_usage * self.sf_loaded
+        return approach * (1 + self.stl_departure_share)
 
     @property
     def has_sf(self):
-        return self.sf_per_trip is not None
+        return self.sf_per_trip is not None or bool(self.sf_loaded)
 
 
 @dataclass
@@ -749,6 +831,11 @@ class Settings:
     round_trip: bool = False
     risk_aversion: float = 1.0
     fee_rate: float = DEFAULT_FEE_RATE
+    pick_fuel: bool = True   # try slider settings when the ship has a flight model
+
+
+REFINE_TOP = 5      # best trips whose slider settings get optimised
+RERUN_SETTINGS = 2  # settings per trip re-run in full after screening
 
 
 @dataclass
@@ -877,7 +964,7 @@ class CycleResult:
 def fuel_units(ship, route, round_trip=False):
     """(SF, FF) units for a flight, or None if the parsec distance is unknown."""
     legs = 2 if round_trip else 1
-    sf = (ship.sf_per_trip or 0.0) * legs
+    sf = ship.sf_units() * legs
     if ship.ff_per_parsec and ship.reactor_usage:
         if route.parsecs is None:
             return None
@@ -978,14 +1065,15 @@ def evaluate_route(origin, dest, leg, ship, settings, market):
 
     # Pass 2: risk per candidate, then walk both books into lots.
     history.prefetch((t, dest) for t in cands)
-    lots, risk = [], {}
+    lots, risk, share = [], {}, {}
     for t in cands:
         w, v = materials[t]
         a, b = books.get(t, origin), books.get(t, dest)
         risk[t] = price_risk(history, t, dest, b.bids[0][0], hours_one_way, "sell")
+        share[t] = depth_share(b.bids, market_volume(market, t, dest), hours_one_way)
         pricing = Pricing(fee=fee, haircut=risk[t]["adj"],
                           export_duty=out.export_duty, import_duty=out.import_duty)
-        lots += build_lots(t, a.asks, b.bids, w, v, pricing)
+        lots += build_lots(t, a.asks, b.bids, w, v, pricing, dest_share=share[t])
 
     basket = optimize_basket(lots, goods_budget, ship.weight, ship.volume)
     if not basket:
@@ -1010,7 +1098,8 @@ def evaluate_route(origin, dest, leg, ship, settings, market):
             ticker=t, units=int(r["units"]),
             buy_vwap=r["raw_buy"] / r["units"], sell_vwap=r["raw_sell"] / r["units"],
             buy_slip=slippage(a.asks, r["units"]),
-            sell_slip=slippage(b.bids, r["units"] / DEST_DEPTH_SHARE),
+            sell_slip=slippage(b.bids, r["units"] / share[t]),
+            depth_share=share[t],
             profit=r["rev"] - r["cost"], sales=r["rev"], cost=r["cost"],
             duty=r["duty"],
             weight=r["units"] * materials[t][0], volume=r["units"] * materials[t][1],
@@ -1138,6 +1227,8 @@ def evaluate_cycle(a, b, f, leg1, leg2, ship, settings, market):
                             pricing=Pricing(fee, haircut=risk1[t]["adj"],
                                             export_duty=x1.export_duty,
                                             import_duty=x1.import_duty),
+                            dest_share=depth_share(
+                                bk_b.bids, market_volume(market, t, b), h1),
                             require_profit=False, max_qty=max_qty(t))
     for t in c2:  # buy at b after leg 1, sell at f after leg 2
         bk_b, bk_f = books.get(t, b), books.get(t, f)
@@ -1148,7 +1239,11 @@ def evaluate_cycle(a, b, f, leg1, leg2, ship, settings, market):
                                             markup=risk2b[t]["adj"],
                                             export_duty=x2.export_duty,
                                             import_duty=x2.import_duty),
-                            ask_share=DEST_DEPTH_SHARE, require_profit=False,
+                            ask_share=depth_share(
+                                bk_b.asks, market_volume(market, t, b), h1),
+                            dest_share=depth_share(
+                                bk_f.bids, market_volume(market, t, f), h1 + h2),
+                            require_profit=False,
                             max_qty=max_qty(t))
 
     sol = optimize_cycle(lots1, lots2, settings.capital, home_upfront, mid_fixed,
@@ -1192,8 +1287,16 @@ def leg_info(routes, ship, a, b):
     r = routes.get((a, b))
     if r is None or r.jumps > ship.max_distance:
         return None
-    hours = (r.hours if r.hours is not None
-             else ship.overhead_hours + ship.hours_per_distance * r.jumps)
+    if ship.ftl_tank and r.parsecs is not None and ship.ff_units(r.parsecs) > ship.ftl_tank:
+        return None  # more FF than the tank holds
+    if r.hours is not None:
+        hours = r.hours
+    elif ship.flight_model:
+        hours = ship.leg_hours(r)
+        if hours is None:
+            return None
+    else:
+        hours = ship.overhead_hours + ship.hours_per_distance * r.jumps
     return r, hours
 
 
@@ -1245,38 +1348,77 @@ def build_ship(args):
            "overhead_hours": cfg.get("overhead_hours"),
            "sf_per_trip": cfg.get("sf_per_trip"),
            "reactor_usage": cfg.get("reactor_usage"),
-           "ff_per_parsec": cfg.get("ff_per_parsec")}
+           "ff_per_parsec": cfg.get("ff_per_parsec"),
+           "sf_loaded": cfg.get("sf_loaded"),
+           "stl_usage": cfg.get("stl_usage"),
+           "stl_departure_share": cfg.get("stl_departure_share"),
+           "flight_model": cfg.get("flight_model"),
+           "stl_tank": cfg.get("stl_tank"), "ftl_tank": cfg.get("ftl_tank")}
     for key, val in (("weight", args.weight), ("volume", args.volume),
                      ("max_distance", args.max_range),
                      ("hours_per_distance", args.hours_per_distance),
                      ("overhead_hours", args.overhead_hours),
                      ("sf_per_trip", args.sf_per_trip),
                      ("reactor_usage", args.reactor_usage),
-                     ("ff_per_parsec", args.ff_per_parsec)):
+                     ("ff_per_parsec", args.ff_per_parsec),
+                     ("sf_loaded", args.sf_loaded),
+                     ("stl_usage", args.stl_usage),
+                     ("ftl_tank", args.ftl_tank)):
         if val is not None:
             cfg[key] = val
     if not cfg["weight"] or not cfg["volume"]:
         raise SystemExit("Give the ship's capacity with --weight and --volume "
                          "(or --ship NAME from ships.json).")
-    return Ship(weight=cfg["weight"], volume=cfg["volume"],
+    if cfg["stl_tank"] and cfg["sf_loaded"] and cfg["sf_loaded"] > cfg["stl_tank"]:
+        raise SystemExit(f"SF loaded ({cfg['sf_loaded']:g}) is more than the STL "
+                         f"tank holds ({cfg['stl_tank']:g}).")
+    ship = Ship(weight=cfg["weight"], volume=cfg["volume"],
                 max_distance=cfg["max_distance"] or math.inf,
                 hours_per_distance=cfg["hours_per_distance"],
                 overhead_hours=cfg["overhead_hours"] or 0.0,
                 sf_per_trip=cfg["sf_per_trip"],
                 reactor_usage=reactor_fraction(cfg["reactor_usage"]),
                 ff_per_parsec=(FF_PER_PARSEC if cfg["ff_per_parsec"] is None
-                               else cfg["ff_per_parsec"]))
+                               else cfg["ff_per_parsec"]),
+                sf_loaded=cfg["sf_loaded"],
+                stl_usage=(DEFAULT_STL_USAGE if cfg["stl_usage"] is None
+                           else reactor_fraction(cfg["stl_usage"], "STL usage")),
+                stl_departure_share=(STL_DEPARTURE_SHARE
+                                     if cfg["stl_departure_share"] is None
+                                     else cfg["stl_departure_share"]),
+                flight_model=load_flight_model(cfg["flight_model"], cfg["sf_loaded"]),
+                ftl_tank=cfg["ftl_tank"])
+    if ship.flight_model:
+        # Start from the nearest settings the model can be trusted at.
+        ship.stl_usage, ship.reactor_usage = ship.flight_model.snap(
+            ship.stl_usage, ship.reactor_usage)
+    return ship
 
 
-def reactor_fraction(value):
-    """Reactor usage as a fraction. Accepts 0.25 or 25 (percent, as SFC shows)."""
+def load_flight_model(data, sf_loaded):
+    if not data:
+        return None
+    if not sf_loaded:
+        print("Note: this ship has a flight model but no sf_loaded, so the model "
+              "is not used. Set sf_loaded in ships.json or pass --sf-loaded.")
+        return None
+    try:
+        return load_model(data)
+    except (TypeError, KeyError) as exc:
+        print(f"Note: flight_model in ships.json is not readable ({exc}); "
+              "re-run freight.py calibrate.")
+        return None
+
+
+def reactor_fraction(value, name="Reactor usage"):
+    """A flight-planner slider as a fraction. Accepts 0.25 or 25 (percent)."""
     if value is None:
         return DEFAULT_REACTOR_USAGE
     value = float(value)
     if value > 1:
         value /= 100
     if not 0 < value <= 1:
-        raise SystemExit(f"Reactor usage must be between 0% and 100%, got {value}.")
+        raise SystemExit(f"{name} must be between 0% and 100%, got {value}.")
     return value
 
 
@@ -1332,7 +1474,8 @@ def print_one_way(best):
     print("z = destination price vs its 30 day mean in standard deviations. "
           "Vol = expected price move over transit. * = thin history, default "
           "volatility assumed. Sell slippage is measured against the share of "
-          "destination depth assumed available.")
+          "destination bids expected to be left when you arrive (shorter "
+          "flights and quieter markets leave more).")
 
 
 def print_cycle(best, cur):
@@ -1374,12 +1517,18 @@ def print_results(results, top, ship, cur=None):
         print("\nNo profitable routes found. Try more capital, a longer range, a "
               "different --mode, or check that distances cover this origin.")
         return
-    print(f"\n{'#':<3}{'Route':<13}{'Type':<8}{'Hrs':>6}{'Capital':>11}"
+    modelled = bool(ship.flight_model)
+    print(f"\n{'#':<3}{'Route':<13}{'Type':<8}"
+          + (f"{'STL/FTL%':>9}" if modelled else "")
+          + f"{'Hrs':>6}{'Capital':>11}"
           f"{'Wt%':>5}{'Vol%':>6}{'Fuel':>9}{'Border':>9}{'Net profit':>12}"
           f"{'Risk 1sd':>10}{'Score/hr':>10}")
     for n, r in enumerate(results[:top], 1):
         fuel = r.fuel if r.kind == "one-way" else r.fuel1 + r.fuel2 * r.mid_rate
-        print(f"{n:<3}{r.label:<13}{r.kind:<8}{r.hours:>6.1f}"
+        sl = getattr(r, "ship", ship).settings_label
+        print(f"{n:<3}{r.label:<13}{r.kind:<8}"
+              + (f"{sl:>9}" if modelled else "")
+              + f"{r.hours:>6.1f}"
               f"{money(r.capital_used):>11}{100 * r.weight_used / ship.weight:>5.0f}"
               f"{100 * r.volume_used / ship.volume:>6.0f}{money(fuel):>9}"
               f"{money(r.border_fees):>9}{money(r.net_profit):>12}"
@@ -1388,6 +1537,9 @@ def print_results(results, top, ship, cur=None):
           "Net profit is after fuel, border fees and duties. For cycles, costs "
           "paid at the middle exchange are converted at the rate the cycle "
           "achieved (display only).")
+    if modelled:
+        print("STL/FTL% = the STL fuel and FTL reactor sliders to set in SFC for "
+              "that trip. Hours and fuel come from your ship's flight model.")
 
     best_one = next((r for r in results if r.kind == "one-way"), None)
     best_cycle = next((r for r in results if r.kind != "one-way"), None)
@@ -1399,11 +1551,15 @@ def print_results(results, top, ship, cur=None):
             print_cycle(best, cur)
     ff = (f"FTL fuel at {100 * ship.reactor_usage:g}% reactor usage "
           f"({ship.ff_per_parsec:g} FF per parsec at 100%)")
-    if ship.has_sf:
-        print(f"\nFuel: {ff}, plus {ship.sf_per_trip:g} SF per flight.")
+    if ship.sf_per_trip is not None:
+        print(f"\nFuel: {ff}, plus {ship.sf_per_trip:g} SF per flight (measured).")
+    elif ship.sf_loaded:
+        print(f"\nFuel: {ff}, plus {ship.sf_units():.0f} SF per flight "
+              f"({ship.sf_loaded:g} SF loaded at {100 * ship.stl_usage:g}% STL "
+              "fuel usage).")
     else:
-        print(f"\nFuel: {ff}. STL fuel (SF) is not included: measure it in SFC "
-              "and run freight.py calibrate, or pass --sf-per-trip.")
+        print(f"\nFuel: {ff}. STL fuel (SF) is not included: pass --sf-loaded "
+              "(and --stl-usage), or --sf-per-trip.")
 
 
 def write_csv(results, path):
@@ -1444,8 +1600,16 @@ def parse_args(argv=None):
                            "automatically)")
     ship.add_argument("--overhead-hours", type=float,
                       help="fixed hours per leg (undocking, STL legs)")
+    ship.add_argument("--sf-loaded", type=float,
+                      help="SF in the tank at take-off. STL fuel per flight is "
+                           "worked out from this and --stl-usage")
+    ship.add_argument("--stl-usage", type=float,
+                      help="STL fuel usage slider in SFC: 50 or 0.5 "
+                           f"(default {100 * DEFAULT_STL_USAGE:g}%%)")
+    ship.add_argument("--ftl-tank", type=float,
+                      help="FF the FTL tank holds; legs needing more are skipped")
     ship.add_argument("--sf-per-trip", type=float,
-                      help="STL fuel per flight (see freight.py calibrate)")
+                      help="measured SF per flight; overrides --sf-loaded")
     ship.add_argument("--reactor-usage", type=float,
                       help="FTL reactor usage you fly at, as in SFC: 25 or 0.25 "
                            f"(default {100 * DEFAULT_REACTOR_USAGE:g}%%)")
@@ -1482,6 +1646,9 @@ def parse_args(argv=None):
     ap.add_argument("--offline", action="store_true",
                     help="use only cached FIO data, never the network")
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--fixed-fuel", action="store_true",
+                    help="with a flight model, fly at --stl-usage/--reactor-usage "
+                         "instead of choosing the best settings per trip")
     ap.add_argument("--csv", help="write all results to this CSV file")
     ap.add_argument("--record", type=int, metavar="N",
                     help="save result #N to the trade log as a trade you are "
@@ -1524,6 +1691,7 @@ def scan_one_way(home, ship, settings, market):
         progress(f"Evaluating {home} > {dest} ({n}/{len(dests)})")
         res = evaluate_route(home, dest, leg, ship, settings, market)
         if res:
+            res.ship = ship
             results.append(res)
     return results
 
@@ -1545,8 +1713,80 @@ def scan_cycles(home, ship, settings, market):
         progress(f"Evaluating {home} > {mid} > {fin} ({n}/{len(plan)})")
         res = evaluate_cycle(home, mid, fin, leg1, leg2, ship, settings, market)
         if res:
+            res.ship = ship
             results.append(res)
     return results
+
+
+def reevaluate(res, ship, settings, market):
+    """The same trip as res, flown by `ship` (other slider settings)."""
+    if res.kind == "one-way":
+        leg = leg_info(market.routes, ship, res.origin, res.dest)
+        out = leg and evaluate_route(res.origin, res.dest, leg, ship, settings, market)
+    else:
+        leg1 = leg_info(market.routes, ship, res.origin, res.mid)
+        leg2 = leg_info(market.routes, ship, res.mid, res.final)
+        out = (leg1 and leg2 and
+               evaluate_cycle(res.origin, res.mid, res.final, leg1, leg2, ship,
+                              settings, market))
+    if out:
+        out.ship = ship
+    return out
+
+
+def screen_setting(res, ship, settings, market):
+    """Quick estimate of res's score if flown by `ship`, keeping the cargo:
+    only fuel, hours and price risk (which grows with the square root of
+    time) change. Used to pick which settings get a full re-run."""
+    legs = ([(res.origin, res.dest)] if res.kind == "one-way"
+            else [(res.origin, res.mid), (res.mid, res.final)])
+    hours, fuel = 0.0, []
+    for a, b in legs:
+        leg = leg_info(market.routes, ship, a, b)
+        if not leg:
+            return None
+        hours += leg[1]
+        fuel.append(fuel_cost(ship, market.books, a, leg[0],
+                              settings.round_trip and res.kind == "one-way"))
+    if any(math.isnan(f) for f in fuel):
+        return None
+    if res.kind == "one-way":
+        hours *= 2 if settings.round_trip else 1
+        old_fuel, new_fuel = res.fuel, fuel[0]
+    else:
+        old_fuel = res.fuel1 + res.fuel2 * res.mid_rate
+        new_fuel = fuel[0] + fuel[1] * res.mid_rate
+    net = res.net_profit + old_fuel - new_fuel
+    risk = res.risk * math.sqrt(hours / res.hours) if res.hours > 0 else res.risk
+    return (net - settings.risk_aversion * risk) / hours
+
+
+def pick_fuel_settings(results, ship, settings, market, top=REFINE_TOP,
+                       rerun=RERUN_SETTINGS):
+    """Choose the STL and reactor sliders for the best trips.
+
+    Every setting the ship's flight model covers is screened with the cargo
+    held fixed, then the most promising ones are re-run in full (new cargo,
+    depth and risk for the new flight time). Faster settings cost more fuel but
+    cut price risk, depth lost on arrival and hours; slower ones are cheaper.
+    The first scan is done at the current settings, so a trip that only pays
+    at another setting can be missed."""
+    if not (ship.flight_model and settings.pick_fuel) or not results:
+        return results
+    variants = [replace(ship, stl_usage=s, reactor_usage=r)
+                for s, r in ship.flight_model.grid()]
+    results = sorted(results, key=lambda r: r.score, reverse=True)
+    head, tail = results[:top], results[top:]
+    better = []
+    for n, res in enumerate(head, 1):
+        progress(f"Choosing fuel settings for {res.label} ({n}/{len(head)})")
+        base = res.ship.settings_label
+        scored = [(sc, v) for v in variants if v.settings_label != base
+                  for sc in [screen_setting(res, v, settings, market)] if sc is not None]
+        scored.sort(key=lambda x: -x[0])
+        tries = [res] + [reevaluate(res, v, settings, market) for _, v in scored[:rerun]]
+        better.append(max((t for t in tries if t), key=lambda t: t.score))
+    return better + tail
 
 
 def main(argv=None):
@@ -1590,7 +1830,7 @@ def main(argv=None):
 
     ship = build_ship(args)
     needs_hours = any(r.hours is None for r in routes.values())
-    if needs_hours and ship.hours_per_distance is None:
+    if needs_hours and ship.hours_per_distance is None and not ship.flight_model:
         raise SystemExit("No travel time for some routes. Set --hours-per-distance "
                          "(or hours_per_distance in ships.json), or add an hours "
                          "column to distances.csv.")
@@ -1620,7 +1860,14 @@ def main(argv=None):
               "shows, or use --border-fee.")
 
     settings = Settings(args.capital, args.round_trip, args.risk_aversion,
-                        args.fee_rate)
+                        args.fee_rate, pick_fuel=not args.fixed_fuel)
+    if ship.flight_model:
+        fm = ship.flight_model
+        print(f"Flight model: fitted from {fm.flights} SFC flights (typical error "
+              f"{60 * fm.rmse_hours:.0f} min). "
+              + (f"Choosing STL/reactor settings per trip {fm.describe()}."
+                 if settings.pick_fuel else
+                 f"Fixed at {ship.settings_label} STL/reactor (--fixed-fuel)."))
     market = Market(books, client.materials(),
                     History(client, enabled=not args.no_history), borders, cur,
                     routes)
@@ -1638,6 +1885,7 @@ def main(argv=None):
             print("Cycle mode needs scipy (pip install scipy). Skipping cycles.")
         else:
             results += scan_cycles(home, ship, settings, market)
+    results = pick_fuel_settings(results, ship, settings, market)
     progress_done()
 
     results.sort(key=lambda r: r.score, reverse=True)

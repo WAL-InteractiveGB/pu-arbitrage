@@ -65,23 +65,75 @@ For accurate numbers, do the two setup steps below: fuel and gateway fees.
 
 ### 1. Fuel
 
-Fuel follows the game's mechanics, as worked out by the player community (the
-game does not publish them):
+Fuel follows the game's mechanics, as reverse-engineered by the player
+community (the game does not publish them; the STL model comes from the
+[prun-toolset](https://github.com/EoinCuinn/prun-toolset) flight planner):
 
 - **FTL fuel (FF) = parsecs flown x 7.2 x reactor usage.** Parsecs come from
   the game's own jump route between the two exchanges (via FIO). Reactor usage
   is the FTL slider in the flight planner (`SFC`); 25% is the cheapest and the
   default. Set `reactor_usage` in `ships.json` or pass `--reactor-usage 40` if
   you fly at another setting.
-- **STL fuel (SF)** is a roughly fixed amount per flight (take-off, departure,
-  approach, landing) that depends on your ship, so you measure it once:
+- **STL fuel (SF) does not scale with distance.** A station-to-station flight
+  has two STL phases. The approach burns 0.494 x the STL fuel slider x the SF
+  loaded in the tank. Departure burns the same at most, and less when the jump
+  gate is close to the station. A higher slider flies faster but burns more,
+  so take your flight time from `SFC` at the same settings. Pass
+  `--sf-loaded 1000 --stl-usage 50`, or set `sf_loaded` and `stl_usage` in
+  `ships.json`. To fit the departure share to your ship (or, better, fit the
+  full flight model below):
   1. Plan two or three fully loaded flights in `SFC` and note the SF and FF it
-     shows and the reactor % you planned at.
+     shows, the reactor % and STL % you planned at, and the SF loaded.
   2. Put them in `flights.csv` (see `flights.example.csv`).
-  3. Run `python freight.py calibrate --ship MyHauler`. It saves `sf_per_trip`
-     to `ships.json` and checks your FF against the 7.2 formula.
+  3. Run `python freight.py calibrate --ship MyHauler`. It saves the STL model
+     to `ships.json` and checks your FF against the 7.2 formula. If you only
+     know the SF each flight used, `--sf-per-trip` still works as an override.
 
 Check it with `python freight.py quote --ship MyHauler --at CI1 --ticker RAT`.
+
+#### Let the tool choose the fuel settings
+
+Faster flights burn more fuel, and slower ones leave the cargo exposed to the
+market for longer: more price risk, more of the destination's bids gone, and
+fewer trips per day. To weigh the two, the tool fits a flight model for your
+ship from flights planned in `SFC`. Planning is free and shows the time and
+fuel.
+
+1. Load a full cargo and your usual SF. Plan (don't fly) one trip at about five
+   settings, moving one slider at a time: STL at 25/50/100% and reactor at
+   25/50/100%. Then plan a trip of a different length at one or two settings.
+2. Add each plan to `flights.csv` with its `hours` (`6h 20m`, `6:20` or
+   `6.33`), the sliders, `sf_loaded`, and the SF and FF shown.
+3. `python freight.py calibrate --ship MyHauler` fits the model and saves it
+   to `ships.json`.
+
+The model is `hours = overhead + stl / (STL x SF loaded) + parsecs x jump x
+e^(beta x (1 - reactor)) + charge x (jumps - 1) x reactor`, with the same
+shape the community's research found but constants fitted to your ship. From
+then on `arbitrage.py --ship MyHauler` scans at your current settings, screens
+every slider combination for the best trips, re-solves the most promising in
+full, and shows the sliders to use in an `STL/FTL%` column. It only picks
+settings inside the range you measured. `--fixed-fuel` turns this off. In the
+web app, the same steps are on the **Ship calibration** tab.
+
+**If the formula doesn't fit your ship**, the typical error shown after fitting
+will be large (the tool warns above 30 minutes). First check for typos and for
+plans made with different cargo or SF loaded. If the rows are right, use
+*measured settings*: plan each setting you want on two routes of different
+length, and the tool draws a straight line of time against parsecs for each one
+with no formula, then only picks among those settings. `--model auto` (the
+default) switches to this by itself when the formula misses by more than 15
+minutes on average; `--model measured` or `--model formula` forces one.
+
+#### Ship profiles
+
+`ships.json` holds any number of ships, each with its own cargo space, tanks
+(`stl_tank`, `ftl_tank`: legs needing more FF than the tank holds are skipped),
+fuel settings and flight model. Pick one with `--ship NAME`. The web app keeps
+the same profiles under the ship picker on **Find trades**. *Duplicate* copies
+a calibration to another ship of the same type, and *Export* / *Import* use the
+`ships.json` format, so a ship calibrated in the browser works in the Python
+tool and can be shared with corp mates flying the same ship.
 
 ### 2. Enter gateway fees (if you use gateways)
 
@@ -146,12 +198,16 @@ survives every cost and the risk of the price moving while it travels.
 **1. Real executable prices, not quotes.** The tool walks each exchange's order
 book level by level instead of using the best bid and ask. Buying 1,000 units
 moves you up the ask ladder, and that slippage is often what kills a spread that
-looks good on screen. It also assumes only half the bids at the destination will
-still be there when you arrive, because other traders keep trading while you fly.
+looks good on screen. Other traders keep trading while you fly, so the bids you
+are counting on thin out. The share still there on arrival is
+exp(-0.5 x daily volume x days in flight / units on the book). Long flights into
+busy, shallow markets keep little, and short hops into deep, quiet ones keep
+most. Daily volume is the 30-day average when price history is loaded, else the
+last 24 hours.
 
 **2. Freight and fixed costs.** Fuel is bought at the departure exchange at its
 real ask prices: FTL fuel per parsec of the actual jump route at your reactor
-setting, plus each ship's measured STL fuel per flight. Gateway fees and any border
+setting, plus STL fuel from the SF loaded and the STL slider. Gateway fees and any border
 costs are deducted in the currency they are paid in. Costs paid before you leave
 come out of your trading capital, so they reduce how much cargo you can buy.
 
@@ -179,8 +235,15 @@ the cash.
 
 ### Known limitations
 
-- The exchange fee (`--fee-rate`, default 1%) and the 50% destination-depth
-  assumption are placeholders. Adjust them to what you see in game.
+- The exchange fee (`--fee-rate`, default 1%) is a placeholder. Adjust it to
+  what you see in game.
+- Depth decay assumes half of the traded volume hits the side you need, spread
+  evenly over the book, and ignores new orders placed while you fly. A market
+  that happened to trade nothing in the last 24 hours looks untouched, so keep
+  price history on.
+- The STL departure burn depends on the gate distance and ship mass, which FIO
+  does not give. It is treated as equal to the approach (an upper bound) unless
+  you calibrate it.
 - Price moves of different goods are treated as independent, which understates
   risk if they move together.
 - Fuel uses community-derived formulas (7.2 FF per parsec at 100% reactor).

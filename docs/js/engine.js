@@ -2,10 +2,16 @@
 // A direct port of arbitrage.py and borders.py: same models, same numbers.
 // No DOM access here, so the engine can be tested on its own.
 
+import { modelHours, modelSF, modelFF, modelGrid } from "./flightmodel.js";
+
 export const C = {
   FEE_RATE: 0.01,            // exchange fee per trade (placeholder)
   UNLIMITED: 1e9,            // quantity for orders with no stated size
-  DEST_DEPTH_SHARE: 0.5,     // share of destination bids assumed still there on arrival
+  // Depth left on arrival = exp(-TAKER_SHARE x daily units traded x days in
+  // transit / units on the book), floored at MIN_DEPTH_SHARE.
+  TAKER_SHARE: 0.5,          // share of traded volume assumed to hit the side you need
+  MIN_DEPTH_SHARE: 0.1,
+  DEST_DEPTH_SHARE: 0.5,     // fallback when FIO gives no volume for an item
   MAX_CANDIDATES: 40,
   MAX_CANDIDATES_CYCLE: 25,
   HISTORY_DAYS: 30,
@@ -16,6 +22,13 @@ export const C = {
   SOLVER_SECONDS: 20,
   FF_PER_PARSEC: 7.2,        // FF per parsec at 100% reactor usage (community-derived)
   DEFAULT_REACTOR_USAGE: 0.25,
+  // STL: approach burns STL_BURN x STL slider x SF loaded; departure the same
+  // at most (less if the gate is close). Community research (prun-toolset).
+  STL_BURN: 0.494,
+  DEFAULT_STL_USAGE: 0.5,
+  STL_DEPARTURE_SHARE: 1,
+  REFINE_TOP: 5,             // best trips whose slider settings get optimised
+  RERUN_SETTINGS: 2,         // settings per trip re-run in full after screening
 };
 
 // Built-in currency map, used only when FIO does not say (same as currencies.py).
@@ -72,6 +85,7 @@ export class BookStore {
     this.books = new Map();
     this.byEx = new Map();
     this.currency = {};
+    this.traded = new Map(); // "T.EX" -> units traded in the last 24 hours
     let withOrders = 0;
     for (const rec of records) {
       const t = rec.MaterialTicker, ex = rec.ExchangeCode;
@@ -80,6 +94,7 @@ export class BookStore {
       this.byEx.get(ex).add(t);
       const cur = pick(rec, "CurrencyCode", "Currency");
       if (typeof cur === "string" && cur.trim()) this.currency[ex] = cur.trim().toUpperCase();
+      if (rec.Traded != null) this.traded.set(`${t}.${ex}`, Number(rec.Traded));
       if ("BuyingOrders" in rec || "SellingOrders" in rec) {
         withOrders++;
         this.books.set(`${t}.${ex}`, {
@@ -117,6 +132,20 @@ export function slippage(levels, qty) {
   const [filled, value] = walkBook(levels, qty);
   if (!filled || !levels.length) return NaN;
   return Math.abs(value / filled / levels[0][0] - 1);
+}
+
+// Share of the displayed book expected to still be there after `hours`.
+export function depthShare(levels, dailyUnits, hours) {
+  if (dailyUnits == null || !Number.isFinite(dailyUnits)) return C.DEST_DEPTH_SHARE;
+  const depth = levels.reduce((t, [, q]) => t + (q < C.UNLIMITED ? q : 0), 0);
+  if (depth <= 0) return 1;
+  const used = C.TAKER_SHARE * dailyUnits * hours / 24;
+  return Math.max(C.MIN_DEPTH_SHARE, Math.exp(-used / depth));
+}
+
+function marketVolume(m, t, ex) {
+  const v = m.history.dailyVolume ? m.history.dailyVolume(t, ex) : null;
+  return v != null ? v : (m.books.traded.get(`${t}.${ex}`) ?? null);
 }
 
 export class Pricing {
@@ -376,13 +405,26 @@ export function describeCrossing(c) {
 export const fmt = (x) => (Number.isFinite(x) ? Math.round(x).toLocaleString("en-US") : "n/a");
 
 // ---------------------------------------------------------------------------
-// Fuel (game model: FF = parsecs x 7.2 x reactor usage; SF per flight)
+// Fuel (game model: FF = parsecs x 7.2 x reactor usage;
+// SF = 0.494 x STL slider x SF loaded, for approach and departure)
 // ---------------------------------------------------------------------------
+export function sfUnits(ship) {
+  if (ship.sfPerTrip != null) return ship.sfPerTrip;
+  if (ship.flightModel && ship.sfLoaded) return modelSF(ship.flightModel, ship.stlUsage, ship.sfLoaded);
+  if (!ship.sfLoaded) return 0;
+  const usage = ship.stlUsage ?? C.DEFAULT_STL_USAGE;
+  const dep = ship.stlDepartureShare ?? C.STL_DEPARTURE_SHARE;
+  return C.STL_BURN * usage * ship.sfLoaded * (1 + dep);
+}
+
 export function fuelUnits(ship, route, roundTrip = false) {
   const legs = roundTrip ? 2 : 1;
-  const sf = (ship.sfPerTrip || 0) * legs;
+  const sf = sfUnits(ship) * legs;
   let ff = 0;
-  if (ship.ffPerParsec && ship.reactorUsage) {
+  if (ship.flightModel) {
+    if (route.parsecs == null) return null;
+    ff = modelFF(ship.flightModel, route.parsecs, ship.reactorUsage) * legs;
+  } else if (ship.ffPerParsec && ship.reactorUsage) {
     if (route.parsecs == null) return null;
     ff = route.parsecs * ship.ffPerParsec * ship.reactorUsage * legs;
   }
@@ -436,8 +478,21 @@ function tradable(m, t, src, dst) {
 export function legInfo(routes, ship, a, b) {
   const r = routes[`${a}>${b}`];
   if (!r || r.jumps > ship.maxJumps) return null;
+  if (ship.ftlTank && r.parsecs != null) {
+    const ff = ship.flightModel ? modelFF(ship.flightModel, r.parsecs, ship.reactorUsage)
+      : r.parsecs * (ship.ffPerParsec || 0) * ship.reactorUsage;
+    if (ff > ship.ftlTank) return null; // more FF than the tank holds
+  }
+  if (ship.flightModel) {
+    if (r.parsecs == null) return null;
+    return { route: r, hours: modelHours(ship.flightModel, r.parsecs, r.jumps, ship.stlUsage,
+                                         ship.reactorUsage, ship.sfLoaded || 0) };
+  }
   return { route: r, hours: ship.overheadHours + ship.hoursPerJump * r.jumps };
 }
+
+export const settingsLabel = (ship) =>
+  `${Math.round(100 * ship.stlUsage)}/${Math.round(100 * ship.reactorUsage)}`;
 
 // One-way trip within one currency. Returns a result object or null.
 export async function evaluateRoute(origin, dest, leg, ship, s, m) {
@@ -465,13 +520,15 @@ export async function evaluateRoute(origin, dest, leg, ship, s, m) {
   if (!cands.length) return null;
 
   await history.prefetch(cands.map((t) => [t, dest]));
-  const lots = [], risk = {};
+  const lots = [], risk = {}, share = {};
   for (const t of cands) {
     const [w, v] = m.materials[t];
     const a = books.get(t, origin), b = books.get(t, dest);
     risk[t] = priceRisk(history.closes(t, dest), b.bids[0][0], leg.hours, "sell");
+    share[t] = depthShare(b.bids, marketVolume(m, t, dest), leg.hours);
     lots.push(...buildLots(t, a.asks, b.bids, w, v, new Pricing({
-      fee: s.feeRate, haircut: risk[t].adj, exportDuty: out.export_duty, importDuty: out.import_duty })));
+      fee: s.feeRate, haircut: risk[t].adj, exportDuty: out.export_duty, importDuty: out.import_duty }),
+      { destShare: share[t] }));
   }
   const basket = optimizeBasket(lots, goodsBudget, ship.weight, ship.volume, m.solver);
   if (!basket.length) return null;
@@ -486,7 +543,7 @@ export async function evaluateRoute(origin, dest, leg, ship, s, m) {
   const items = [...agg].map(([t, r]) => ({
     ticker: t, units: r.units, buy_vwap: r.rawBuy / r.units, sell_vwap: r.rawSell / r.units,
     buySlip: slippage(books.get(t, origin).asks, r.units),
-    sellSlip: slippage(books.get(t, dest).bids, r.units / C.DEST_DEPTH_SHARE),
+    sellSlip: slippage(books.get(t, dest).bids, r.units / share[t]), depthShare: share[t],
     profit: r.rev - r.cost, sales: r.rev, cost: r.cost, duty: r.duty,
     weight: r.units * m.materials[t][0], volume: r.units * m.materials[t][1],
     z: risk[t].z, vol: risk[t].vol, thin: risk[t].thin,
@@ -583,7 +640,7 @@ export async function evaluateCycle(a, b, f, leg1, leg2, ship, s, m) {
     risk1[t] = priceRisk(history.closes(t, b), bkB.bids[0][0], h1, "sell");
     lots1.push(...buildLots(t, bkA.asks, bkB.bids, ...materials[t],
       new Pricing({ fee: s.feeRate, haircut: risk1[t].adj, exportDuty: x1.export_duty, importDuty: x1.import_duty }),
-      { requireProfit: false, maxQty: maxQty(t) }));
+      { destShare: depthShare(bkB.bids, marketVolume(m, t, b), h1), requireProfit: false, maxQty: maxQty(t) }));
   }
   for (const t of c2) {
     const bkB = books.get(t, b), bkF = books.get(t, f);
@@ -592,7 +649,9 @@ export async function evaluateCycle(a, b, f, leg1, leg2, ship, s, m) {
     lots2.push(...buildLots(t, bkB.asks, bkF.bids, ...materials[t],
       new Pricing({ fee: s.feeRate, haircut: risk2f[t].adj, markup: risk2b[t].adj,
                     exportDuty: x2.export_duty, importDuty: x2.import_duty }),
-      { askShare: C.DEST_DEPTH_SHARE, requireProfit: false, maxQty: maxQty(t) }));
+      { askShare: depthShare(bkB.asks, marketVolume(m, t, b), h1),
+        destShare: depthShare(bkF.bids, marketVolume(m, t, f), h1 + h2),
+        requireProfit: false, maxQty: maxQty(t) }));
   }
   const sol = optimizeCycle(lots1, lots2, s.capital, homeUpfront, midFixed, ship.weight,
                             ship.volume, midConvertible, m.solver);
@@ -669,8 +728,78 @@ export async function scan(home, ship, s, m, onProgress = () => {}) {
     // let the page repaint between routes
     await new Promise((r) => setTimeout(r, 0));
     const res = await plan[i].run();
-    if (res) results.push(res);
+    if (res) { res.ship = ship; results.push(res); }
   }
+  const out = await pickFuelSettings(results, ship, s, m, onProgress);
   onProgress("Done", 1);
-  return results.sort((x, y) => y.score - x.score);
+  return out.sort((x, y) => y.score - x.score);
+}
+
+// ---------------------------------------------------------------------------
+// Choosing the STL and reactor sliders (needs a fitted flight model)
+// ---------------------------------------------------------------------------
+async function reevaluate(res, ship, s, m) {
+  let out;
+  if (res.kind === "one-way") {
+    const leg = legInfo(m.routes, ship, res.origin, res.dest);
+    out = leg && await evaluateRoute(res.origin, res.dest, leg, ship, s, m);
+  } else {
+    const leg1 = legInfo(m.routes, ship, res.origin, res.mid);
+    const leg2 = legInfo(m.routes, ship, res.mid, res.final);
+    out = leg1 && leg2 && await evaluateCycle(res.origin, res.mid, res.final, leg1, leg2, ship, s, m);
+  }
+  if (out) out.ship = ship;
+  return out || null;
+}
+
+// Quick score estimate for res flown by `ship`, keeping the cargo: only fuel,
+// hours and price risk (square root of time) change.
+function screenSetting(res, ship, s, m) {
+  const oneWay = res.kind === "one-way";
+  const legs = oneWay ? [[res.origin, res.dest]] : [[res.origin, res.mid], [res.mid, res.final]];
+  let hours = 0;
+  const fuel = [];
+  for (const [a, b] of legs) {
+    const leg = legInfo(m.routes, ship, a, b);
+    if (!leg) return null;
+    hours += leg.hours;
+    fuel.push(fuelCost(ship, m.books, a, leg.route, s.roundTrip && oneWay));
+  }
+  if (fuel.some(Number.isNaN)) return null;
+  let oldFuel, newFuel;
+  if (oneWay) {
+    if (s.roundTrip) hours *= 2;
+    oldFuel = res.fuel; newFuel = fuel[0];
+  } else {
+    oldFuel = res.fuel1 + res.fuel2 * res.midRate;
+    newFuel = fuel[0] + fuel[1] * res.midRate;
+  }
+  const net = res.netProfit + oldFuel - newFuel;
+  const risk = res.hours > 0 ? res.risk * Math.sqrt(hours / res.hours) : res.risk;
+  return (net - s.riskAversion * risk) / hours;
+}
+
+export async function pickFuelSettings(results, ship, s, m, onProgress = () => {}) {
+  if (!ship.flightModel || !s.pickFuel || !results.length) return results;
+  const variants = modelGrid(ship.flightModel).map(([stl, re]) => ({ ...ship, stlUsage: stl, reactorUsage: re }));
+  const sorted = [...results].sort((x, y) => y.score - x.score);
+  const head = sorted.slice(0, C.REFINE_TOP), tail = sorted.slice(C.REFINE_TOP);
+  const better = [];
+  for (let n = 0; n < head.length; n++) {
+    const res = head[n];
+    onProgress(`Choosing fuel settings for ${res.label} (${n + 1}/${head.length})`, n / head.length);
+    await new Promise((r) => setTimeout(r, 0));
+    const base = settingsLabel(res.ship);
+    const scored = [];
+    for (const v of variants) {
+      if (settingsLabel(v) === base) continue;
+      const sc = screenSetting(res, v, s, m);
+      if (sc != null) scored.push([sc, v]);
+    }
+    scored.sort((x, y) => y[0] - x[0]);
+    const tries = [res];
+    for (const [, v] of scored.slice(0, C.RERUN_SETTINGS)) tries.push(await reevaluate(res, v, s, m));
+    better.push(tries.filter(Boolean).reduce((a, b) => (b.score > a.score ? b : a)));
+  }
+  return [...better, ...tail];
 }

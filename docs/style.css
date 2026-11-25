@@ -148,3 +148,23 @@ table.data { width: 100%; border-collapse: collapse; font-size: 14px; }
 .closeform button { padding: 5px 10px; }
 
 .foot { text-align: center; color: var(--muted); font-size: 13px; padding: 20px; border-top: 1px solid var(--line); }
+
+/* Ship calibration */
+.calib input, .calib select { margin-top: 0; padding: 5px 6px; width: 68px; }
+.calib select { width: 76px; }
+.calib input.time { width: 92px; }
+.calib .x { padding: 5px 9px; }
+.calib td { padding: 4px 6px; }
+.model-note { font-size: 13px; padding: 8px 10px; margin: 6px 0 10px; border: 1px solid var(--line); border-radius: 8px; }
+.model-note b { color: var(--text); }
+.fit-summary { margin-top: 12px; }
+.fit-summary ul { margin: 6px 0; padding-left: 20px; }
+
+/* Ship picker */
+.ship-pick { margin-bottom: 8px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.ship-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.ghost.small, .filebtn.small { padding: 4px 10px; font-size: 13px; margin: 0; }
+label.inline { display: inline-flex; align-items: center; gap: 6px; margin-left: 6px; }
+label.inline select { margin-top: 0; width: auto; }
+
+input:disabled { opacity: 0.45; cursor: not-allowed; }

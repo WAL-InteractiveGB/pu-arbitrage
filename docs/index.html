@@ -20,6 +20,7 @@
   </div>
   <nav class="tabs" role="tablist">
     <button role="tab" data-tab="find" aria-selected="true">Find trades</button>
+    <button role="tab" data-tab="calib" aria-selected="false">Ship calibration <span id="calib-pill" class="pill" hidden>on</span></button>
     <button role="tab" data-tab="log" aria-selected="false">Trade log <span id="open-count" class="pill" hidden></span></button>
     <button role="tab" data-tab="about" aria-selected="false">How it works</button>
   </nav>
@@ -32,6 +33,20 @@
       <form id="setup" class="setup" autocomplete="off">
         <fieldset class="card">
           <legend>Ship and cash</legend>
+          <div class="ship-pick">
+            <label>Ship
+              <select id="ship-select" aria-describedby="ship-help"></select>
+            </label>
+            <div class="ship-actions">
+              <button type="button" id="ship-new" class="ghost small">New</button>
+              <button type="button" id="ship-dup" class="ghost small" title="Copies the calibration too: ships of the same type fly the same">Duplicate</button>
+              <button type="button" id="ship-rename" class="ghost small">Rename</button>
+              <button type="button" id="ship-delete" class="ghost small">Delete</button>
+              <button type="button" id="ship-export" class="ghost small" title="Download this ship as ships.json (works with the Python tool too)">Export</button>
+              <label class="ghost small filebtn">Import<input id="ship-import" type="file" accept=".json,application/json" hidden></label>
+            </div>
+            <small id="ship-help">Each ship keeps its own cargo space, fuel settings and calibration.</small>
+          </div>
           <label>Ship is at
             <select id="home" required><option value="">Loading...</option></select>
           </label>
@@ -49,6 +64,15 @@
           </div>
           <small>Shown on your ship's cargo hold (the ship's inventory screen).</small>
           <div class="row2">
+            <label>STL tank (SF)
+              <input id="stlTank" type="number" min="1" step="1" placeholder="optional">
+            </label>
+            <label>FTL tank (FF)
+              <input id="ftlTank" type="number" min="1" step="1" placeholder="optional">
+            </label>
+          </div>
+          <small>With the FTL tank set, trips that need more FF than it holds are skipped.</small>
+          <div class="row2">
             <label>Hours per jump
               <input id="hoursPerJump" type="number" min="0" step="0.1" required>
             </label>
@@ -63,19 +87,34 @@
 
         <fieldset class="card">
           <legend>Fuel</legend>
+          <div id="model-note" class="model-note" hidden></div>
+          <label class="check" id="pickFuel-wrap" hidden><input id="pickFuel" type="checkbox"> Let the tool choose the sliders for each trip</label>
           <label>FTL reactor usage (%)
             <input id="reactor" type="number" min="1" max="100" step="1" required>
-            <small>The FTL slider in the flight planner (SFC). 25% is the cheapest.</small>
+            <small>The FTL slider in the flight planner (SFC). Lower burns less FF but charges more slowly.</small>
           </label>
-          <label>STL fuel (SF) per flight
-            <input id="sfPerTrip" type="number" min="0" step="1" placeholder="not set">
-            <small>Plan a loaded flight in SFC and copy the SF it needs. Leave empty to ignore SF.</small>
-          </label>
+          <div class="row2">
+            <label>SF loaded at take-off
+              <input id="sfLoaded" type="number" min="0" step="1" placeholder="not set">
+            </label>
+            <label>STL fuel usage (%)
+              <input id="stlUsage" type="number" min="1" max="100" step="1">
+            </label>
+          </div>
+          <small>STL fuel isn't per distance: each STL phase (leaving and arriving) burns about 49% of the SF you loaded × the STL slider in SFC. Higher sliders fly faster but burn more, so use the flight time SFC shows at the same settings.</small>
           <details>
             <summary>Advanced</summary>
+            <label>Departure burn (% of approach)
+              <input id="stlDeparture" type="number" min="0" max="100" step="1">
+              <small>100% is the upper bound. Departure needs less when the jump gate is close to the station. Lower it if SFC shows less SF than this tool.</small>
+            </label>
+            <label>Measured SF per flight
+              <input id="sfPerTrip" type="number" min="0" step="1" placeholder="use the estimate">
+              <small>If you copy the exact SF from SFC here, it replaces the estimate.</small>
+            </label>
             <label>FF per parsec at 100% reactor
               <input id="ffPerParsec" type="number" min="0" step="0.1">
-              <small>Community-derived game constant: 7.2.</small>
+              <small>Game constant: reactor power ÷ 333, which is 7.2 for the common 2,400 reactor.</small>
             </label>
           </details>
         </fieldset>
@@ -126,7 +165,7 @@
           <div class="table-scroll">
             <table id="results" class="data">
               <thead><tr>
-                <th>#</th><th>Route</th><th>Type</th><th class="n">Hours</th><th class="n">Capital</th>
+                <th>#</th><th>Route</th><th>Type</th><th class="n" title="STL fuel slider / FTL reactor slider to set in SFC">STL / FTL</th><th class="n">Hours</th><th class="n">Capital</th>
                 <th class="n">Hold</th><th class="n">Fuel</th><th class="n">Fees</th>
                 <th class="n">Net profit</th><th class="n">Risk (1 sd)</th><th class="n">Score / hr</th>
               </tr></thead>
@@ -147,6 +186,51 @@
           <p class="muted">Your settings and trade log stay in this browser. Nothing is sent anywhere except requests for public market data to <a href="https://doc.fnar.net" target="_blank" rel="noopener">FIO</a>.</p>
         </div>
       </div>
+    </div>
+  </section>
+
+  <!-- ============================== CALIBRATION ============================== -->
+  <section id="tab-calib" class="tab" hidden>
+    <div class="card prose">
+      <h2>Ship calibration: <span id="calib-ship"></span></h2>
+      <p>Faster flights burn more fuel, and slower ones leave the cargo exposed to the market for longer. To weigh one against the other, the tool needs to know how <em>your</em> ship's flight time and fuel change with the two sliders in the flight planner. The game doesn't publish this, but planning a flight in <b>SFC</b> is free and shows both, so you can measure it in about ten minutes.</p>
+      <h3>How to measure</h3>
+      <ol>
+        <li>Load your ship with a full cargo and the SF you normally carry. Cargo weight changes STL speed.</li>
+        <li>Open <b>SFC</b> and plan, but don't fly, a trip between two exchanges. For each plan, copy the flight time, the SF and FF it needs, and the two slider values into a row below.</li>
+        <li>Plan the same trip at a few settings. Move <b>one slider at a time</b>: try the STL slider at 25%, 50% and 100%, then the reactor at 25%, 50% and 100%.</li>
+        <li>Plan a second trip of a different length at one or two settings, so the tool can tell per-parsec time from fixed time.</li>
+        <li>Press <b>Fit model</b>. From then on, <b>Find trades</b> picks the slider settings for each trip when this ship is selected.</li>
+      </ol>
+      <p class="muted small">Six or more flights work best. The tool only picks settings between the lowest and highest values you planned at, so it never guesses outside what you measured. Times can be typed as <code>6h 20m</code>, <code>6:20</code> or <code>6.33</code>.</p>
+    </div>
+    <div class="card">
+      <div class="table-scroll">
+        <table id="calib" class="data calib">
+          <thead><tr>
+            <th>From</th><th>To</th><th class="n">STL %</th><th class="n">Reactor %</th><th class="n">SF loaded</th>
+            <th class="n">Flight time</th><th class="n">SF used</th><th class="n">FF used</th>
+            <th class="n">Parsecs</th><th class="n">Model time</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="buttons">
+        <button type="button" id="calib-add" class="ghost">+ Add flight</button>
+        <button type="button" id="calib-suggest" class="ghost">Add the suggested set of 7</button>
+        <button type="button" id="calib-fit" class="primary">Fit model</button>
+        <button type="button" id="calib-clear" class="ghost">Turn model off</button>
+        <label class="inline">Model
+          <select id="calib-mode">
+            <option value="auto">Auto: formula unless it fits badly</option>
+            <option value="formula">Formula</option>
+            <option value="measured">Measured settings only</option>
+          </select>
+        </label>
+      </div>
+      <p class="muted small">If the formula doesn't fit your ship, <b>Measured settings</b> uses no formula: it draws a straight line through your flights for each slider setting you planned on two routes, and only picks from those settings.</p>
+      <div id="calib-status" class="status" role="status" aria-live="polite"></div>
+      <div id="calib-result"></div>
     </div>
   </section>
 
@@ -182,9 +266,11 @@
       <h2>How it works</h2>
       <p>Prosperous Universe is a small, self-contained version of physical commodity trading. This tool looks at a cargo the way a commodity trader would: buy where a good is cheap, pay to move it, sell where it is dear, but only if the spread survives every cost and the risk of the price moving while it travels.</p>
       <h3>1. Real prices, not quotes</h3>
-      <p>It walks each exchange's order book level by level. Buying a lot of something moves you up the ask ladder, and that slippage often kills a spread that looks good on screen. It also assumes only half the bids at the destination will still be there when you arrive, because other players keep trading while you fly.</p>
+      <p>It walks each exchange's order book level by level. Buying a lot of something moves you up the ask ladder, and that slippage often kills a spread that looks good on screen. Other players keep trading while you fly, so the bids you are counting on thin out. The share still there on arrival is e<sup>−0.5 × daily volume × days in flight ÷ units on the book</sup>. Long flights into busy, shallow markets keep little, and short hops into deep, quiet ones keep most. Daily volume is the 30-day average when price history is on, otherwise the last 24 hours. Half of it is assumed to hit the bids.</p>
       <h3>2. Freight costs</h3>
-      <p>Fuel follows the game's mechanics as worked out by the community. FTL fuel = parsecs flown × 7.2 × reactor usage, using the game's own jump routes. STL fuel is a roughly fixed amount per flight that you measure in SFC. Fuel is priced at the departure exchange's real asks. Gateway fees are deducted in the currency they are paid in.</p>
+      <p>Fuel follows the game's mechanics as reverse-engineered by the community (the <a href="https://github.com/EoinCuinn/prun-toolset" target="_blank" rel="noopener">prun-toolset</a> flight planner). FTL fuel = parsecs flown × reactor power ÷ 333 × reactor usage (7.2 FF per parsec at 100% for a 2,400 reactor), using the game's own jump routes. STL fuel doesn't scale with distance: the approach burns 0.494 × the STL slider × the SF you loaded, and departure burns up to the same. Higher sliders are faster but cost more fuel. Fuel is priced at the departure exchange's real asks. Gateway fees are deducted in the currency they are paid in.</p>
+      <h3>Choosing the fuel settings</h3>
+      <p>Faster flights cost more fuel, and slower ones leave the cargo exposed to the market for longer, with more price risk, more of the destination's bids gone, and fewer trips per day. Once you calibrate your ship (see the Ship calibration tab), the tool screens every STL and reactor combination you measured for the best trips, re-solves the most promising ones in full, and tells you which sliders to set.</p>
       <h3>3. Choosing the cargo</h3>
       <p>Picking what to load is a knapsack problem with three limits at once: cash, weight and volume. It is solved exactly as an integer program (the HiGHS solver, running in your browser), so the answer is often a mix: a dense, valuable good to use the weight limit plus a light, bulky one to fill the space.</p>
       <h3>4. Price risk in transit</h3>
@@ -193,7 +279,7 @@
       <p>Each faction has its own currency, and the tool assumes you cannot convert between them. A round trip A → B → A is solved as one problem: the return cargo can only be bought with what the first cargo earned at B, profit is measured in your home currency, and cash stranded at B counts as zero.</p>
       <h3>Limitations</h3>
       <ul>
-        <li>The exchange fee and the 50% depth assumption are estimates. Adjust them to what you see in game.</li>
+        <li>The exchange fee is an estimate. Adjust it to what you see in game. Depth decay assumes trading is spread evenly over the book and ignores new orders placed while you fly.</li>
         <li>Price moves of different goods are treated as independent, which understates risk if they move together.</li>
         <li>The order books are a snapshot. The more players arbitrage the same gaps, the smaller they get. That is good for the game's markets.</li>
       </ul>

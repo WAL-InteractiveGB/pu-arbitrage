@@ -2,16 +2,18 @@
 import * as E from "./engine.js";
 import { Fio, History, DEFAULT_API } from "./fio.js";
 import * as Log from "./tradelog.js";
+import { initCalib, getModel, refreshCalib } from "./calib.js";
+import * as Ships from "./ships.js";
+import { modelSnap } from "./flightmodel.js";
 
 const HIGHS_BASE = "https://cdn.jsdelivr.net/npm/highs@1.15.4/build/";
 const SETTINGS_KEY = "pua:settings";
+// Trader settings. Ship settings (cargo, tanks, fuel) live in ship profiles.
 const DEFAULTS = {
-  home: "", capital: 500000, weight: 500, volume: 500, hoursPerJump: 1.5, overheadHours: 0,
-  maxJumps: "", reactor: 25, sfPerTrip: "", ffPerParsec: E.C.FF_PER_PARSEC, gateways: [],
-  flatFee: "", mode: "both", feeRate: 1, riskAversion: 1, roundTrip: false, useHistory: true,
+  home: "", capital: 500000, gateways: [],
+  flatFee: "", mode: "both", feeRate: 1, riskAversion: 1, roundTrip: false, useHistory: true, pickFuel: true,
 };
-const FIELDS = ["capital", "weight", "volume", "hoursPerJump", "overheadHours", "maxJumps", "reactor",
-  "sfPerTrip", "ffPerParsec", "flatFee", "mode", "feeRate", "riskAversion", "roundTrip", "useHistory"];
+const FIELDS = ["capital", "flatFee", "mode", "feeRate", "riskAversion", "roundTrip", "useHistory", "pickFuel"];
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
@@ -36,7 +38,13 @@ function loadSettings() {
 }
 
 function saveSettings() {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(readForm())); } catch { /* ignore */ }
+  const f = readForm();
+  const trader = { home: f.home, gateways: f.gateways };
+  for (const k of FIELDS) trader[k] = f[k];
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(trader)); } catch { /* ignore */ }
+  const ship = {};
+  for (const k of Ships.SHIP_FIELDS) ship[k] = f[k];
+  Ships.update(ship);
 }
 
 function fillForm(s) {
@@ -44,13 +52,83 @@ function fillForm(s) {
     const el = $(`#${k}`);
     if (el.type === "checkbox") el.checked = !!s[k]; else el.value = s[k];
   }
+  fillShip();
   $("#gw-rows").innerHTML = "";
   for (const g of s.gateways || []) addGatewayRow(g);
 }
 
+// Ship fields and the picker, from the current ship profile.
+function fillShip() {
+  const ship = Ships.current();
+  for (const k of Ships.SHIP_FIELDS) $(`#${k}`).value = ship[k] ?? Ships.SHIP_DEFAULTS[k];
+  $("#ship-select").innerHTML = Ships.list().map((x) =>
+    `<option value="${esc(x.id)}"${x.id === ship.id ? " selected" : ""}>${esc(x.name)}</option>`).join("");
+  $("#ship-delete").disabled = Ships.list().length < 2;
+}
+
+function shipChanged() {
+  fillShip();
+  refreshCalib();
+  updateModelNote();
+  state.results = [];
+  $("#results-wrap").hidden = true;
+  $("#detail").hidden = true;
+  $("#empty").hidden = false;
+}
+
+function initShips() {
+  $("#ship-select").onchange = (e) => { saveSettings(); Ships.select(e.target.value); shipChanged(); };
+  $("#ship-new").onclick = () => {
+    const name = prompt("Name for the new ship:", "New ship");
+    if (name == null) return;
+    saveSettings();
+    Ships.create(name);
+    shipChanged();
+  };
+  $("#ship-dup").onclick = () => {
+    const cur = Ships.current();
+    const name = prompt("Name for the copy (it keeps the calibration):", `${cur.name} copy`);
+    if (name == null) return;
+    saveSettings();
+    Ships.create(name, cur.id);
+    shipChanged();
+  };
+  $("#ship-rename").onclick = () => {
+    const name = prompt("New name:", Ships.current().name);
+    if (name == null) return;
+    Ships.rename(name);
+    shipChanged();
+  };
+  $("#ship-delete").onclick = () => {
+    const cur = Ships.current();
+    if (!confirm(`Delete ${cur.name} and its calibration from this browser? This can't be undone. Export it first if you want to keep a copy.`)) return;
+    try { Ships.remove(); } catch (err) { alert(err.message); return; }
+    shipChanged();
+  };
+  $("#ship-export").onclick = () => {
+    saveSettings();
+    const name = Ships.current().name.replace(/[^\w.-]+/g, "_");
+    download(`ships_${name}.json`, Ships.exportJson(), "application/json");
+  };
+  $("#ship-import").onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      saveSettings();
+      const added = Ships.importJson(await file.text());
+      shipChanged();
+      status(`Imported ${added.join(", ")}.`);
+    } catch (err) {
+      alert(`Could not import: ${err.message}`);
+    } finally {
+      e.target.value = "";
+    }
+  };
+}
+
 function readForm() {
   const out = {};
-  for (const k of FIELDS) {
+  for (const k of [...FIELDS, ...Ships.SHIP_FIELDS]) {
     const el = $(`#${k}`);
     out[k] = el.type === "checkbox" ? el.checked : el.value;
   }
@@ -86,6 +164,21 @@ function refreshExchangeSelects() {
     `<option value="${esc(e)}"${e === home ? " selected" : ""}>${esc(e)} · ${esc(state.data.currency[e] || "?")}</option>`).join("");
   $("#gw-rows").innerHTML = "";
   for (const g of s.gateways || []) addGatewayRow(g);
+  refreshCalib();
+}
+
+// Shows whether a fitted flight model is in use on the Find trades form.
+function updateModelNote() {
+  const model = getModel();
+  const note = $("#model-note");
+  note.hidden = !model;
+  $("#pickFuel-wrap").hidden = !model;
+  $("#calib-pill").hidden = !model;
+  for (const id of ["hoursPerJump", "overheadHours"]) $(`#${id}`).disabled = !!model;
+  if (!model) return;
+  note.innerHTML = `Using your <b>ship calibration</b> (${model.flights} flights, typical error
+    ${Math.round(60 * model.rmse_hours)} min). Flight times come from it, so hours per jump is ignored.
+    The sliders below are the starting point.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -154,19 +247,32 @@ async function run() {
   let ship, s, borders;
   const warnings = [];
   try {
+    const model = getModel();
     ship = {
+      stlTank: num(f.stlTank, "STL tank", { min: 1, optional: true }),
+      ftlTank: num(f.ftlTank, "FTL tank", { min: 1, optional: true }),
       weight: num(f.weight, "Cargo weight", { min: 1 }), volume: num(f.volume, "Cargo volume", { min: 1 }),
-      hoursPerJump: num(f.hoursPerJump, "Hours per jump", { min: 0 }),
+      hoursPerJump: model ? 0 : num(f.hoursPerJump, "Hours per jump", { min: 0 }),
+      flightModel: model,
       overheadHours: num(f.overheadHours, "Extra hours", { min: 0, optional: true }) || 0,
       maxJumps: num(f.maxJumps, "Max jumps", { min: 1, optional: true }) ?? Infinity,
       reactorUsage: num(f.reactor, "Reactor usage", { min: 1 }) / 100,
-      sfPerTrip: num(f.sfPerTrip, "SF per flight", { min: 0, optional: true }),
+      sfLoaded: num(f.sfLoaded, "SF loaded", { min: 0, optional: true }),
+      stlUsage: (num(f.stlUsage, "STL fuel usage", { min: 1, optional: true }) ?? 100 * E.C.DEFAULT_STL_USAGE) / 100,
+      stlDepartureShare: (num(f.stlDeparture, "Departure burn", { min: 0, optional: true }) ?? 100) / 100,
+      sfPerTrip: num(f.sfPerTrip, "Measured SF per flight", { min: 0, optional: true }),
       ffPerParsec: num(f.ffPerParsec, "FF per parsec", { min: 0, optional: true }) ?? E.C.FF_PER_PARSEC,
     };
     if (ship.reactorUsage > 1) throw new Error("Reactor usage can't be above 100%.");
+    if (model && !ship.sfLoaded) ship.sfLoaded = model.sf_loaded;
+    if (ship.stlTank && ship.sfLoaded > ship.stlTank) throw new Error(`SF loaded (${ship.sfLoaded}) is more than the STL tank holds (${ship.stlTank}).`);
+    if (model) [ship.stlUsage, ship.reactorUsage] = modelSnap(model, ship.stlUsage, ship.reactorUsage);
+    if (ship.stlUsage > 1) throw new Error("STL fuel usage can't be above 100%.");
+    if (ship.stlDepartureShare > 1) throw new Error("Departure burn can't be above 100% of the approach.");
     s = { capital: num(f.capital, "Cash", { min: 1 }), roundTrip: f.roundTrip,
           riskAversion: num(f.riskAversion, "Risk aversion", { min: 0 }),
-          feeRate: num(f.feeRate, "Exchange fee", { min: 0 }) / 100, mode: f.mode };
+          feeRate: num(f.feeRate, "Exchange fee", { min: 0 }) / 100, mode: f.mode,
+          pickFuel: !!model && f.pickFuel };
     const routes = {};
     for (const g of f.gateways) {
       if (g.fee === "" || g.from === g.to) continue;
@@ -179,7 +285,7 @@ async function run() {
     status(err.message, null, true);
     return;
   }
-  if (!ship.sfPerTrip) warnings.push("STL fuel (SF) isn't set, so only FTL fuel is counted. Copy the SF figure from SFC for a fuller cost.");
+  if (ship.sfPerTrip == null && !ship.sfLoaded) warnings.push("SF loaded isn't set, so STL fuel isn't counted. Enter how much SF you take off with for a fuller cost.");
 
   $("#run").disabled = true;
   try {
@@ -223,6 +329,7 @@ function renderResults() {
     <tr data-i="${i}" tabindex="0">
       <td>${i + 1}</td><td>${esc(r.label.replaceAll(">", " → "))}</td>
       <td><span class="tag">${esc(r.kind)}</span></td>
+      <td class="n">${sliders(r.ship || ship)}</td>
       <td class="n">${r.hours.toFixed(1)}</td><td class="n">${fmt(r.capitalUsed)}</td>
       <td class="n">${Math.round(100 * r.weightUsed / ship.weight)}% / ${Math.round(100 * r.volumeUsed / ship.volume)}%</td>
       <td class="n">${fmt(r.fuelHome)}</td><td class="n">${fmt(r.borderFees)}</td>
@@ -237,6 +344,8 @@ function renderResults() {
   if (results.length) showDetail(0, false);
   else $("#detail").hidden = true;
 }
+
+const sliders = (sh) => `${Math.round(100 * sh.stlUsage)}% / ${Math.round(100 * sh.reactorUsage)}%`;
 
 function itemTable(items, cin, cout) {
   return `<div class="table-scroll"><table class="data"><thead><tr>
@@ -255,17 +364,20 @@ function crossingLine(c) {
 
 function steps(r) {
   const buy = (items) => items.map((i) => `${fmt(i.units)} ${esc(i.ticker)} (avg ${f2(i.buy_vwap)})`).join(", ");
+  const sh = r.ship || state.lastRun.ship;
+  const plan = `In SFC, set the STL slider to <b>${Math.round(100 * sh.stlUsage)}%</b> and the reactor to <b>${Math.round(100 * sh.reactorUsage)}%</b>`
+    + (sh.flightModel ? ` (about ${r.hours.toFixed(1)} h in all).` : ".");
   if (r.kind === "one-way") {
     return `<ol>
       <li>At <b>${esc(r.origin)}</b>, buy fuel, then buy ${buy(r.items)}.</li>
-      <li>Fly to <b>${esc(r.dest)}</b>${r.crossings[0].entry_fee ? ` (gateway fee ${fmt(r.crossings[0].entry_fee)})` : ""}.</li>
+      <li>${plan} Fly to <b>${esc(r.dest)}</b>${r.crossings[0].entry_fee ? ` (gateway fee ${fmt(r.crossings[0].entry_fee)})` : ""}.</li>
       <li>Sell everything there.${state.lastRun.s.roundTrip ? ` Fly home empty.` : ""}</li></ol>`;
   }
   return `<ol>
     <li>At <b>${esc(r.origin)}</b>, buy fuel, then buy ${buy(r.leg1)}.</li>
-    <li>Fly to <b>${esc(r.mid)}</b> and sell all of it.</li>
+    <li>${plan} Fly to <b>${esc(r.mid)}</b> and sell all of it.</li>
     <li>At <b>${esc(r.mid)}</b>, buy fuel, then buy ${buy(r.leg2)} with the proceeds.</li>
-    <li>Fly to <b>${esc(r.final)}</b> and sell everything.</li></ol>`;
+    <li>Fly to <b>${esc(r.final)}</b> at the same settings and sell everything.</li></ol>`;
 }
 
 function showDetail(i, scroll = true) {
@@ -384,6 +496,14 @@ function setTab(name) {
 function init() {
   for (const b of document.querySelectorAll(".tabs button")) b.onclick = () => setTab(b.dataset.tab);
   fillForm(loadSettings());
+  initShips();
+  initCalib({
+    getData: () => state.data,
+    getHome: () => $("#home").value || loadSettings().home,
+    getSfLoaded: () => $("#sfLoaded").value,
+    onChange: updateModelNote,
+  });
+  updateModelNote();
   $("#setup").addEventListener("input", saveSettings);
   $("#setup").addEventListener("change", saveSettings);
   $("#setup").addEventListener("submit", (e) => { e.preventDefault(); run(); });

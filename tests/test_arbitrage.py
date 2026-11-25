@@ -2,11 +2,13 @@
 import os
 import sys
 import tempfile
+import math
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import arbitrage as A  # noqa: E402
+import flightmodel as FM  # noqa: E402
 import tradelog  # noqa: E402
 from borders import BorderModel  # noqa: E402
 
@@ -104,6 +106,138 @@ class FuelTests(unittest.TestCase):
         # FF = 40 pc x 7.2 x 0.25 = 72 units: 50 at 20 + 22 at 30
         cost = A.fuel_cost(ship, books, "CI1", A.Route(5, 40.0))
         self.assertAlmostEqual(cost, 100 * 10 + 50 * 20 + 22 * 30)
+
+
+    def test_stl_fuel_follows_loaded_fuel_and_slider(self):
+        base = dict(weight=500, volume=500)
+        self.assertEqual(A.Ship(**base).sf_units(), 0.0)
+        ship = A.Ship(**base, sf_loaded=1000, stl_usage=0.5)
+        # approach + departure, each 0.494 x 50% x 1000
+        self.assertAlmostEqual(ship.sf_units(), 2 * 0.494 * 0.5 * 1000)
+        faster = A.Ship(**base, sf_loaded=1000, stl_usage=1.0)
+        self.assertAlmostEqual(faster.sf_units(), 2 * ship.sf_units())
+        short_dep = A.Ship(**base, sf_loaded=1000, stl_usage=0.5,
+                           stl_departure_share=0.0)
+        self.assertAlmostEqual(short_dep.sf_units(), 0.494 * 0.5 * 1000)
+        measured = A.Ship(**base, sf_loaded=1000, sf_per_trip=300)
+        self.assertEqual(measured.sf_units(), 300)
+
+
+class DepthTests(unittest.TestCase):
+    def test_depth_left_falls_with_time_and_volume(self):
+        bids = [(10.0, 600), (9.0, 400)]          # 1000 units on the book
+        self.assertEqual(A.depth_share(bids, None, 10), A.DEST_DEPTH_SHARE)
+        self.assertEqual(A.depth_share(bids, 0, 10), 1.0)
+        short = A.depth_share(bids, 1000, 6)
+        long = A.depth_share(bids, 1000, 48)
+        self.assertAlmostEqual(short, math.exp(-0.5 * 1000 * 6 / 24 / 1000))
+        self.assertGreater(short, long)
+        busier = A.depth_share(bids, 4000, 6)
+        self.assertGreater(short, busier)
+        self.assertEqual(A.depth_share(bids, 10 ** 6, 48), A.MIN_DEPTH_SHARE)
+
+    def test_market_makers_are_not_depth(self):
+        bids = [(10.0, A.UNLIMITED)]
+        self.assertEqual(A.depth_share(bids, 1000, 24), 1.0)
+
+
+class FlightModelTests(unittest.TestCase):
+    TRUE = FM.FlightModel(0.4, 1.5, 0.10, 1.1, 0.12, 7.2, 0.9, (0.25, 1), (0.25, 1), 0, 0)
+
+    def flights(self, settings, routes=((61.4, 9), (94.0, 12))):
+        out = []
+        for pc, j in routes:
+            for s, r in settings:
+                out.append(dict(parsecs=pc, jumps=j, stl_usage=s, reactor=r,
+                                sf_loaded=1000, hours=self.TRUE.hours(pc, j, s, r, 1000),
+                                sf=self.TRUE.sf(s, 1000), ff=self.TRUE.ff(pc, r)))
+        return out
+
+    def test_fit_recovers_time_and_fuel(self):
+        m = FM.fit(self.flights([(0.5, 0.5), (0.25, 0.5), (1, 0.5), (0.5, 0.25), (0.5, 1)]))
+        for pc, j, s, r in [(70, 10, 0.75, 0.75), (120, 15, 0.25, 1.0)]:
+            self.assertAlmostEqual(m.hours(pc, j, s, r, 1000),
+                                   self.TRUE.hours(pc, j, s, r, 1000), delta=0.05)
+        self.assertAlmostEqual(m.sf_coef, 0.9)
+        self.assertAlmostEqual(m.ff_per_parsec, 7.2)
+        self.assertLess(m.rmse_hours, 0.01)
+
+    def test_grid_stays_inside_measured_range(self):
+        m = FM.fit(self.flights([(0.5, 0.25), (1, 0.25), (0.75, 0.25)]))
+        self.assertEqual({r for _, r in m.grid()}, {0.25})
+        self.assertEqual({s for s, _ in m.grid()}, {0.5, 0.75, 1.0})
+        self.assertTrue(any("Reactor" in n for n in m.notes))
+
+    def test_too_few_flights(self):
+        with self.assertRaises(ValueError):
+            FM.fit(self.flights([(0.5, 0.5)], routes=((61.4, 9),)))
+
+    def test_parse_duration(self):
+        self.assertAlmostEqual(FM.parse_duration("6h 20m 57s"), 6 + 20 / 60 + 57 / 3600)
+        self.assertAlmostEqual(FM.parse_duration("6:30"), 6.5)
+        self.assertAlmostEqual(FM.parse_duration("1d 2h"), 26)
+        self.assertAlmostEqual(FM.parse_duration("6.25"), 6.25)
+        with self.assertRaises(ValueError):
+            FM.parse_duration("six hours")
+
+    def test_ship_uses_model(self):
+        m = FM.fit(self.flights([(0.5, 0.5), (0.25, 0.5), (1, 0.5), (0.5, 0.25), (0.5, 1)]))
+        ship = A.Ship(weight=500, volume=500, sf_loaded=1000, stl_usage=0.5,
+                      reactor_usage=1.0, flight_model=m)
+        route = A.Route(9, 61.4, None)
+        self.assertAlmostEqual(ship.sf_units(), 450, delta=0.5)
+        self.assertAlmostEqual(ship.ff_units(61.4), 7.2 * 61.4, delta=0.5)
+        self.assertAlmostEqual(ship.leg_hours(route),
+                               self.TRUE.hours(61.4, 9, 0.5, 1.0, 1000), delta=0.05)
+        self.assertEqual(ship.settings_label, "50/100")
+
+
+class FallbackAndTankTests(unittest.TestCase):
+    @staticmethod
+    def odd_ship_flights():
+        # time grows with the square of distance: not the formula's shape
+        t = lambda pc, s, r: 1 + 0.002 * pc * pc / r ** 0.3 + 2 / s
+        return [dict(parsecs=pc, jumps=j, stl_usage=s, reactor=r, sf_loaded=1000,
+                     hours=t(pc, s, r), sf=900 * s, ff=7.2 * pc * r)
+                for pc, j in ((40, 6), (61.4, 9), (94, 12))
+                for s, r in ((0.5, 0.5), (1, 1), (0.25, 0.25))]
+
+    def test_auto_switches_to_measured_when_formula_fits_badly(self):
+        fl = self.odd_ship_flights()
+        formula = FM.fit_auto(fl, "formula")
+        auto = FM.fit_auto(fl)
+        self.assertEqual(auto.kind, "measured")
+        self.assertLess(auto.rmse_hours, formula.rmse_hours)
+        self.assertEqual(sorted(auto.grid()), [(0.25, 0.25), (0.5, 0.5), (1, 1)])
+        self.assertTrue(any("formula missed" in n for n in auto.notes))
+
+    def test_measured_snaps_to_measured_settings(self):
+        m = FM.fit_measured(self.odd_ship_flights())
+        self.assertEqual(m.snap(0.6, 0.45), (0.5, 0.5))
+        self.assertAlmostEqual(m.sf(0.5, 1000), 450)
+        self.assertAlmostEqual(m.ff(10, 1.0), 72)
+
+    def test_measured_needs_two_routes_per_setting(self):
+        fl = [f for f in self.odd_ship_flights() if f["parsecs"] == 40]
+        with self.assertRaises(ValueError):
+            FM.fit_measured(fl)
+
+    def test_saved_models_round_trip_and_tolerate_web_extras(self):
+        m = FM.fit_measured(self.odd_ship_flights())
+        self.assertEqual(FM.load_model(m.to_dict()).grid(), m.grid())
+        f = FM.fit_auto(self.odd_ship_flights(), "formula")
+        d = f.to_dict()
+        d["sf_loaded"] = 1000  # the web app stores this too
+        self.assertEqual(FM.load_model(d).kind, "formula")
+
+    def test_ftl_tank_limits_range(self):
+        routes = {("CI1", "AI1"): A.Route(9, 61.4, 10.0)}
+        ship = A.Ship(weight=500, volume=500, reactor_usage=1.0)
+        self.assertIsNotNone(A.leg_info(routes, ship, "CI1", "AI1"))
+        small = A.Ship(weight=500, volume=500, reactor_usage=1.0, ftl_tank=400)
+        self.assertIsNone(A.leg_info(routes, small, "CI1", "AI1"))  # needs ~442 FF
+        slow = A.Ship(weight=500, volume=500, reactor_usage=0.5, ftl_tank=400)
+        self.assertIsNotNone(A.leg_info(routes, slow, "CI1", "AI1"))
 
 
 class OptimizerTests(unittest.TestCase):

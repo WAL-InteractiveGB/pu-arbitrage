@@ -7,7 +7,10 @@
       "overhead_hours": 0.0,
       "max_distance": 40,
       "reactor_usage": 0.25,
-      "sf_per_trip": 457.5
+      "stl_tank": 1000,
+      "ftl_tank": 1000,
+      "sf_loaded": 1000,
+      "stl_usage": 0.5
     }
   }
 }
