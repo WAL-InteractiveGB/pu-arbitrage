@@ -7,11 +7,11 @@ const OLD_SETTINGS = "pua:settings", OLD_CALIB = "pua:calib";
 
 // Form fields that belong to a ship rather than to the trader.
 export const SHIP_FIELDS = ["weight", "volume", "stlTank", "ftlTank", "hoursPerJump", "overheadHours",
-  "maxJumps", "reactor", "sfLoaded", "stlUsage", "stlDeparture", "sfPerTrip", "ffPerParsec"];
+  "reactor", "sfLoaded", "stlUsage", "stlDeparture", "sfPerTrip", "ffPerParsec"];
 
 export const SHIP_DEFAULTS = {
   weight: 500, volume: 500, stlTank: "", ftlTank: "", hoursPerJump: 1.5, overheadHours: 0,
-  maxJumps: "", reactor: 25, sfLoaded: "", stlUsage: 50, stlDeparture: 100, sfPerTrip: "", ffPerParsec: 7.2,
+  reactor: 25, sfLoaded: "", stlUsage: 50, stlDeparture: 100, sfPerTrip: "", ffPerParsec: 7.2,
 };
 
 const blankCalib = () => ({ rows: [], model: null, mode: "auto" });
@@ -109,7 +109,7 @@ function toPython(ship) {
     sf_loaded: numOrNull(ship.sfLoaded), stl_usage: frac(ship.stlUsage),
     reactor_usage: frac(ship.reactor), stl_departure_share: frac(ship.stlDeparture),
     hours_per_distance: numOrNull(ship.hoursPerJump), overhead_hours: numOrNull(ship.overheadHours),
-    max_distance: numOrNull(ship.maxJumps), sf_per_trip: numOrNull(ship.sfPerTrip),
+    sf_per_trip: numOrNull(ship.sfPerTrip),
     ff_per_parsec: numOrNull(ship.ffPerParsec),
   };
   const calib = ship.calib || {};
@@ -130,7 +130,7 @@ function fromPython(name, p) {
     stlUsage: pct(p.stl_usage) || SHIP_DEFAULTS.stlUsage, reactor: pct(p.reactor_usage) || SHIP_DEFAULTS.reactor,
     stlDeparture: pct(p.stl_departure_share) || SHIP_DEFAULTS.stlDeparture,
     hoursPerJump: val(p.hours_per_distance, SHIP_DEFAULTS.hoursPerJump),
-    overheadHours: val(p.overhead_hours, SHIP_DEFAULTS.overheadHours), maxJumps: val(p.max_distance, ""),
+    overheadHours: val(p.overhead_hours, SHIP_DEFAULTS.overheadHours),
     sfPerTrip: val(p.sf_per_trip, ""), ffPerParsec: val(p.ff_per_parsec, SHIP_DEFAULTS.ffPerParsec),
     calib: { rows: Array.isArray(p.flights) ? p.flights : [], model: null, mode: p.model_mode || "auto" },
   };

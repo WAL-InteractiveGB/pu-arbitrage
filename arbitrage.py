@@ -785,7 +785,6 @@ STL_DEPARTURE_SHARE = 1.0
 class Ship:
     weight: float
     volume: float
-    max_distance: float = math.inf   # jumps per leg
     hours_per_distance: float | None = None  # hours per jump
     overhead_hours: float = 0.0
     sf_per_trip: float | None = None   # measured SF per flight (overrides the model)
@@ -1288,9 +1287,9 @@ def evaluate_cycle(a, b, f, leg1, leg2, ship, settings, market):
 
 
 def leg_info(routes, ship, a, b):
-    """(Route, hours) for one leg, or None if unknown or out of range."""
+    """(Route, hours) for one leg, or None if unknown or beyond the FTL tank."""
     r = routes.get((a, b))
-    if r is None or r.jumps > ship.max_distance:
+    if r is None:
         return None
     if ship.ftl_tank and r.parsecs is not None and ship.ff_units(r.parsecs) > ship.ftl_tank:
         return None  # more FF than the tank holds
@@ -1348,7 +1347,6 @@ def build_ship(args):
               "follows the game (parsecs x reactor usage). Re-run "
               "freight.py calibrate to set reactor_usage.")
     cfg = {"weight": cfg.get("cargo_weight"), "volume": cfg.get("cargo_volume"),
-           "max_distance": cfg.get("max_distance"),
            "hours_per_distance": cfg.get("hours_per_distance"),
            "overhead_hours": cfg.get("overhead_hours"),
            "sf_per_trip": cfg.get("sf_per_trip"),
@@ -1360,7 +1358,6 @@ def build_ship(args):
            "flight_model": cfg.get("flight_model"),
            "stl_tank": cfg.get("stl_tank"), "ftl_tank": cfg.get("ftl_tank")}
     for key, val in (("weight", args.weight), ("volume", args.volume),
-                     ("max_distance", args.max_range),
                      ("hours_per_distance", args.hours_per_distance),
                      ("overhead_hours", args.overhead_hours),
                      ("sf_per_trip", args.sf_per_trip),
@@ -1378,7 +1375,6 @@ def build_ship(args):
         raise SystemExit(f"SF loaded ({cfg['sf_loaded']:g}) is more than the STL "
                          f"tank holds ({cfg['stl_tank']:g}).")
     ship = Ship(weight=cfg["weight"], volume=cfg["volume"],
-                max_distance=cfg["max_distance"] or math.inf,
                 hours_per_distance=cfg["hours_per_distance"],
                 overhead_hours=cfg["overhead_hours"] or 0.0,
                 sf_per_trip=cfg["sf_per_trip"],
@@ -1608,7 +1604,6 @@ def parse_args(argv=None):
     ship.add_argument("--ships-file", default="ships.json")
     ship.add_argument("--weight", type=float, help="max cargo weight, tons")
     ship.add_argument("--volume", type=float, help="max cargo volume, m3")
-    ship.add_argument("--max-range", type=float, help="max distance per leg (jumps)")
     ship.add_argument("--hours-per-distance", type=float,
                       help="hours per unit of distance (per jump when fetched "
                            "automatically)")
@@ -1700,7 +1695,7 @@ def scan_one_way(home, ship, settings, market):
     for n, dest in enumerate(dests, 1):
         leg = leg_info(market.routes, ship, home, dest)
         if not leg:
-            log(f"  {home}>{dest}: no distance or out of range")
+            log(f"  {home}>{dest}: no distance, or needs more FF than the tank holds")
             continue
         progress(f"Evaluating {home} > {dest} ({n}/{len(dests)})")
         res = evaluate_route(home, dest, leg, ship, settings, market)

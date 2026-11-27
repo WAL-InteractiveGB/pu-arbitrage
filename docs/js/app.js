@@ -256,7 +256,6 @@ async function run() {
       hoursPerJump: model ? 0 : num(f.hoursPerJump, "Hours per jump", { min: 0 }),
       flightModel: model,
       overheadHours: num(f.overheadHours, "Extra hours", { min: 0, optional: true }) || 0,
-      maxJumps: num(f.maxJumps, "Max jumps", { min: 1, optional: true }) ?? Infinity,
       reactorUsage: num(f.reactor, "Reactor usage", { min: 1 }) / 100,
       sfLoaded: num(f.sfLoaded, "SF loaded", { min: 0, optional: true }),
       stlUsage: (num(f.stlUsage, "STL fuel usage", { min: 1, optional: true }) ?? 100 * E.C.DEFAULT_STL_USAGE) / 100,

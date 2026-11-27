@@ -477,7 +477,7 @@ function tradable(m, t, src, dst) {
 
 export function legInfo(routes, ship, a, b) {
   const r = routes[`${a}>${b}`];
-  if (!r || r.jumps > ship.maxJumps) return null;
+  if (!r) return null;
   if (ship.ftlTank && r.parsecs != null) {
     const ff = ship.flightModel ? modelFF(ship.flightModel, r.parsecs, ship.reactorUsage)
       : r.parsecs * (ship.ffPerParsec || 0) * ship.reactorUsage;
