@@ -183,6 +183,20 @@ The report shows, over all closed trades:
 - **Bias:** the average error. A negative number means the model is optimistic.
 - **Profit per hour flown**, plus the best and worst trades.
 
+Flew a trade without logging it first? Add it afterwards and it counts towards
+profit and profit per hour, but not towards the accuracy figures, since there
+was no prediction to compare against:
+
+```bash
+python tradelog.py add --route "CI1>AI1>CI1" --kind cycle --currency CIS \
+    --profit 50699 --hours 72 --note "fees, fuel and anything assumed"
+```
+
+On the website the same is under **Trade log → Add a past trade**.
+
+Every item in the results is shown with its FIO category (metals, minerals,
+consumables (basic), electronic parts, ...) next to the ticker.
+
 Each prediction is saved at the moment you record it, before the trade happens,
 so the track record can't be fitted after the fact.
 

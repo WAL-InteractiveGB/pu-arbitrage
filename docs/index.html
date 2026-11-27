@@ -251,6 +251,23 @@
         </table>
       </div>
       <p id="log-empty" class="muted">No trades yet. Find a trade, then press <b>Log this trade</b> before you fly it.</p>
+      <details class="add-trade">
+        <summary>Add a past trade</summary>
+        <p class="muted small">For a trade you flew without logging it first. It counts towards your profit and profit per hour, but not towards how accurate the model is.</p>
+        <form id="add-trade" class="add-trade-form">
+          <label>Route <input name="route" required placeholder="CI1>AI1>CI1"></label>
+          <label>Type
+            <select name="kind"><option value="one-way">one-way</option><option value="cycle">cycle</option><option value="2-leg">2-leg</option></select>
+          </label>
+          <label>Currency <input name="currency" required placeholder="CIS" maxlength="4"></label>
+          <label>Net profit <input name="profit" type="number" step="1" required></label>
+          <label>Hours <input name="hours" type="number" step="0.5" min="0"></label>
+          <label>Flown out <input name="opened" type="date"></label>
+          <label>Last sale <input name="closed" type="date"></label>
+          <label class="wide">Note <input name="note" placeholder="Fees, fuel, anything assumed"></label>
+          <button class="primary" type="submit">Add trade</button>
+        </form>
+      </details>
       <div class="buttons">
         <button id="export-json" class="ghost">Export log (JSON)</button>
         <button id="export-md" class="ghost">Export track record (Markdown)</button>

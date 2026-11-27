@@ -240,6 +240,22 @@ class FallbackAndTankTests(unittest.TestCase):
         self.assertIsNotNone(A.leg_info(routes, slow, "CI1", "AI1"))
 
 
+class ManualTradeTests(unittest.TestCase):
+    def test_manual_trade_counts_profit_not_accuracy(self):
+        data = {"version": 1, "trades": []}
+        tradelog.add_manual(data, route="CI1>AI1>CI1", kind="cycle", currency="CIS",
+                            profit=50699, hours=72)
+        s = tradelog.stats(data["trades"])
+        self.assertEqual(s["n"], 1)
+        self.assertEqual(s["n_predicted"], 0)
+        self.assertAlmostEqual(s["total_actual"], 50699)
+        self.assertAlmostEqual(s["profit_per_hour"], 50699 / 72)
+        self.assertTrue(math.isnan(s["within_1sd"]))
+        r = tradelog.row(data["trades"][0])
+        self.assertEqual((r["pred"], r["actual"], r["hours"]), ("-", "50,699", "72"))
+        self.assertIn("| - |", tradelog.markdown(data))
+
+
 class OptimizerTests(unittest.TestCase):
     def test_respects_capital_weight_volume(self):
         lots = [A.Lot("A", 1000, 10, 12, 10, 12, 1, 1),

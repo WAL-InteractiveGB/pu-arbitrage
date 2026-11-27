@@ -21,6 +21,11 @@ Workflow
            python tradelog.py report --markdown track_record.md
 
 Other commands
+    python tradelog.py add --route CI1>AI1>CI1 --kind cycle --currency CIS \
+        --profit 50700 --hours 72 --note "..."
+                                       a finished trade that was never logged
+                                       with a prediction (counts towards
+                                       profit, not towards model accuracy)
     python tradelog.py list            open trades
     python tradelog.py show 3          everything stored for one trade
     python tradelog.py abandon 3       trade not taken or not finished
@@ -120,6 +125,29 @@ def record_result(result, *, home, currency, capital, ship, settings,
     return trade
 
 
+def add_manual(data, *, route, kind, currency, profit, hours=None, home=None,
+               ship=None, opened_at=None, closed_at=None, legs=None,
+               breakdown=None, note=None):
+    """Append a finished trade that has no logged prediction."""
+    trade = {
+        "id": max((t["id"] for t in data["trades"]), default=0) + 1,
+        "status": "closed",
+        "opened_at": opened_at or now(),
+        "closed_at": closed_at or now(),
+        "route": route, "kind": kind, "home": home or route.split(">")[0],
+        "currency": currency, "ship": ship, "capital": None, "settings": None,
+        "predicted": None,
+        "legs": legs or [],
+        "actual": {"net_profit": round(profit, 2), "hours": hours,
+                   "hours_measured": hours is not None, "received": None,
+                   "spent": None, "costs": None, "breakdown": breakdown,
+                   "note": note},
+        "source": "manual",
+    }
+    data["trades"].append(trade)
+    return trade
+
+
 # ----------------------------------------------------------------------------
 # Closing a trade
 # ----------------------------------------------------------------------------
@@ -145,25 +173,32 @@ def close(data, trade_id, profit=None, received=None, spent=None, costs=0.0,
 # Reporting
 # ----------------------------------------------------------------------------
 def stats(trades):
-    """Summary numbers over closed trades."""
+    """Summary numbers over closed trades. Accuracy figures use only trades
+    that were logged with a prediction; profit figures use all of them."""
     closed = [t for t in trades if t["status"] == "closed"]
     if not closed:
         return None
-    pred = [t["predicted"]["net_profit"] for t in closed]
     act = [t["actual"]["net_profit"] for t in closed]
-    risk = [t["predicted"]["risk_1sd"] for t in closed]
-    hours = [t["actual"]["hours"] for t in closed]
-    within = sum(1 for p, a, r in zip(pred, act, risk) if r > 0 and abs(a - p) <= r)
+    timed = [t for t in closed if t["actual"].get("hours")]
+    hours = sum(t["actual"]["hours"] for t in timed)
+    predicted = [t for t in closed if t.get("predicted")]
+    pred = [t["predicted"]["net_profit"] for t in predicted]
+    pact = [t["actual"]["net_profit"] for t in predicted]
+    risk = [t["predicted"]["risk_1sd"] for t in predicted]
+    within = sum(1 for p, a, r in zip(pred, pact, risk) if r > 0 and abs(a - p) <= r)
     total_pred, total_act = sum(pred), sum(act)
     return {
         "n": len(closed),
+        "n_predicted": len(predicted),
         "total_predicted": total_pred,
         "total_actual": total_act,
-        "capture": total_act / total_pred if total_pred else math.nan,
+        "capture": sum(pact) / total_pred if total_pred else math.nan,
         "win_rate": sum(1 for a in act if a > 0) / len(act),
-        "within_1sd": within / len(closed),
-        "mean_error": sum(a - p for p, a in zip(pred, act)) / len(closed),
-        "profit_per_hour": total_act / sum(hours) if sum(hours) else math.nan,
+        "within_1sd": within / len(predicted) if predicted else math.nan,
+        "mean_error": (sum(a - p for p, a in zip(pred, pact)) / len(predicted)
+                       if predicted else math.nan),
+        "profit_per_hour": (sum(t["actual"]["net_profit"] for t in timed) / hours
+                            if hours else math.nan),
         "best": max(closed, key=lambda t: t["actual"]["net_profit"]),
         "worst": min(closed, key=lambda t: t["actual"]["net_profit"]),
         "currencies": sorted({t["currency"] or "?" for t in closed}),
@@ -179,19 +214,21 @@ def pct(x):
 
 
 def row(t):
-    p = t["predicted"]
+    p = t.get("predicted")
     a = t["actual"] or {}
     actual = a.get("net_profit")
-    err = (actual - p["net_profit"]) if actual is not None else None
+    err = (actual - p["net_profit"]) if actual is not None and p else None
     z = (err / p["risk_1sd"]) if err is not None and p["risk_1sd"] else None
+    hours = a.get("hours") if a.get("hours") is not None else (p or {}).get("hours")
     return {
         "id": t["id"], "date": t["opened_at"][:10], "route": t["route"],
         "kind": t["kind"], "cur": t["currency"] or "",
-        "pred": m(p["net_profit"]), "risk": m(p["risk_1sd"]),
+        "pred": m(p["net_profit"]) if p else "-",
+        "risk": m(p["risk_1sd"]) if p else "-",
         "actual": m(actual) if actual is not None else t["status"],
         "error": (f"{err:+,.0f}" if err is not None else ""),
         "z": f"{z:+.1f}" if z is not None else "",
-        "hours": f"{a.get('hours', p['hours']):.0f}",
+        "hours": f"{hours:.0f}" if hours is not None else "",
     }
 
 
@@ -205,17 +242,25 @@ def summary_lines(s):
     cur = "/".join(s["currencies"])
     note = (" (mixed home currencies: totals add different currencies)"
             if len(s["currencies"]) > 1 else "")
-    return [
+    lines = [
         f"Closed trades: {s['n']}{note}",
-        f"Predicted profit: {m(s['total_predicted'])} {cur}",
-        f"Actual profit:    {m(s['total_actual'])} {cur}  "
-        f"(captured {pct(s['capture'])} of prediction)",
+        f"Actual profit:    {m(s['total_actual'])} {cur}",
         f"Profitable trades: {pct(s['win_rate'])}",
-        f"Results within the predicted 1 sd risk band: {pct(s['within_1sd'])} "
-        "(about 68% means the risk estimate is well calibrated)",
-        f"Average error per trade: {s['mean_error']:+,.0f} "
-        "(negative means the model is optimistic)",
         f"Actual profit per hour flown: {m(s['profit_per_hour'])}",
+    ]
+    if s["n_predicted"]:
+        lines += [
+            f"Trades with a logged prediction: {s['n_predicted']}. Predicted "
+            f"{m(s['total_predicted'])} {cur}, captured {pct(s['capture'])}",
+            f"Results within the predicted 1 sd risk band: {pct(s['within_1sd'])} "
+            "(about 68% means the risk estimate is well calibrated)",
+            f"Average error per trade: {s['mean_error']:+,.0f} "
+            "(negative means the model is optimistic)",
+        ]
+    else:
+        lines.append("No trades logged with a prediction yet, so no accuracy "
+                     "figures. Use --record (or Log this trade) before flying.")
+    return lines + [
         f"Best: #{s['best']['id']} {s['best']['route']} "
         f"{m(s['best']['actual']['net_profit'])}; worst: #{s['worst']['id']} "
         f"{s['worst']['route']} {m(s['worst']['actual']['net_profit'])}",
@@ -246,9 +291,9 @@ def markdown(data):
     trades = data["trades"]
     s = stats(trades)
     out = ["# Track record", "",
-           f"Generated {now()[:10]} by `tradelog.py`. Each trade was logged with "
-           "the optimizer's prediction before it was flown, then closed with the "
-           "real result.", ""]
+           f"Generated {now()[:10]} by `tradelog.py`. Trades logged before they "
+           "were flown carry the optimizer's prediction; trades added afterwards "
+           "(Predicted shown as -) count towards profit only.", ""]
     if s:
         out += ["## Summary", ""] + [f"- {line}" for line in summary_lines(s)] + [""]
     out += ["## Trades", "",
@@ -288,6 +333,18 @@ def main(argv=None):
     p.add_argument("--hours", type=float, help="actual hours from departure to "
                    "last sale (defaults to the predicted hours)")
     p.add_argument("--note", help="anything worth remembering")
+    p = sub.add_parser("add", help="add a finished trade that had no logged prediction")
+    p.add_argument("--route", required=True, help="e.g. CI1>AI1>CI1")
+    p.add_argument("--kind", default="one-way", choices=["one-way", "cycle", "2-leg"])
+    p.add_argument("--currency", required=True, help="home currency, e.g. CIS")
+    p.add_argument("--profit", type=float, required=True, help="net profit, home currency")
+    p.add_argument("--hours", type=float, help="hours from departure to last sale")
+    p.add_argument("--ship")
+    p.add_argument("--opened", help="date flown out, YYYY-MM-DD")
+    p.add_argument("--closed", help="date of the last sale, YYYY-MM-DD")
+    p.add_argument("--details", metavar="JSON",
+                   help="optional JSON file with legs and a cost breakdown")
+    p.add_argument("--note")
     p = sub.add_parser("abandon", help="mark a trade as not taken")
     p.add_argument("id", type=int)
     p = sub.add_parser("report", help="predicted vs actual for every trade")
@@ -313,6 +370,20 @@ def main(argv=None):
         diff = t["actual"]["net_profit"] - t["predicted"]["net_profit"]
         print(f"Closed #{t['id']} {t['route']}: actual {m(t['actual']['net_profit'])} "
               f"vs predicted {m(t['predicted']['net_profit'])} ({diff:+,.0f}).")
+    elif args.cmd == "add":
+        extra = {}
+        if args.details:
+            with open(args.details) as f:
+                extra = json.load(f)
+        day = lambda d: f"{d}T00:00:00+00:00" if d else None
+        t = add_manual(data, route=args.route, kind=args.kind, currency=args.currency,
+                       profit=args.profit, hours=args.hours, ship=args.ship,
+                       opened_at=day(args.opened), closed_at=day(args.closed),
+                       legs=extra.get("legs"), breakdown=extra.get("breakdown"),
+                       note=args.note)
+        save(data, args.log)
+        print(f"Added #{t['id']} {t['route']}: {m(t['actual']['net_profit'])} "
+              f"{t['currency']} (no prediction logged).")
     elif args.cmd == "abandon":
         t = find(data, args.id)
         t["status"], t["closed_at"] = "abandoned", now()

@@ -237,6 +237,11 @@ class FioClient:
         return {m["Ticker"]: (m.get("Weight"), m.get("Volume"))
                 for m in rows if m.get("Ticker")}
 
+    def categories(self):
+        """{ticker: category} from /material/allmaterials, e.g. SI: metals."""
+        rows = self.get("/material/allmaterials", ttl=86400)
+        return {m["Ticker"]: m.get("CategoryName") or "" for m in rows if m.get("Ticker")}
+
     def stations(self):
         try:
             data = self.get("/exchange/station", ttl=7 * 86400)
@@ -1452,6 +1457,13 @@ def border_line(c):
     return f"{c.origin}>{c.dest} [{tag}]: {c.describe()}"
 
 
+CATEGORIES = {}  # ticker -> FIO category (metals, minerals, consumables (basic)...)
+
+
+def category(ticker):
+    return CATEGORIES.get(ticker, "")
+
+
 def print_one_way(best):
     print(f"\nBest one-way basket: {best.label}")
     print(f"  sales {money(best.sales)} - purchases {money(best.purchases)} "
@@ -1462,12 +1474,13 @@ def print_one_way(best):
               "of import/export duty)")
     for c in best.crossings:
         print("  " + border_line(c))
-    print(f"{'Item':<6}{'Units':>8}{'Buy VWAP':>10}{'Sell VWAP':>11}"
+    print(f"{'Item':<6}{'Category':<24}{'Units':>8}{'Buy VWAP':>10}{'Sell VWAP':>11}"
           f"{'BuySlip':>9}{'SellSlip':>9}{'Duty':>9}{'Profit':>10}{'z':>6}{'Vol':>7}")
     for i in best.items:
         z = "n/a" if math.isnan(i["z"]) else f"{i['z']:.1f}"
         flag = "*" if i["thin"] else ""
-        print(f"{i['ticker']:<6}{i['units']:>8}{i['buy_vwap']:>10.2f}"
+        print(f"{i['ticker']:<6}{category(i['ticker']):<24}{i['units']:>8}"
+              f"{i['buy_vwap']:>10.2f}"
               f"{i['sell_vwap']:>11.2f}{100 * i['buy_slip']:>8.1f}%"
               f"{100 * i['sell_slip']:>8.1f}%{money(i['duty']):>9}"
               f"{money(i['profit']):>10}{z:>6}{100 * i['vol']:>6.1f}%{flag}")
@@ -1503,10 +1516,11 @@ def print_cycle(best, cur):
         if any(duties):
             print(f"  duties included: export {money(duties[0])} {cin}, "
                   f"import {money(duties[1])} {cout}")
-        print(f"{'Item':<6}{'Units':>8}{'Buy VWAP':>10}{'Sell VWAP':>11}"
-              f"{'Spent ' + cin:>12}{'Got ' + cout:>12}")
+        print(f"{'Item':<6}{'Category':<24}{'Units':>8}{'Buy VWAP':>10}"
+              f"{'Sell VWAP':>11}{'Spent ' + cin:>12}{'Got ' + cout:>12}")
         for i in items:
-            print(f"{i['ticker']:<6}{i['units']:>8}{i['buy_vwap']:>10.2f}"
+            print(f"{i['ticker']:<6}{category(i['ticker']):<24}{i['units']:>8}"
+                  f"{i['buy_vwap']:>10.2f}"
                   f"{i['sell_vwap']:>11.2f}{money(i['spent']):>12}"
                   f"{money(i['received']):>12}")
 
@@ -1566,7 +1580,7 @@ def write_csv(results, path):
     with open(path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["kind", "route", "hours", "net_profit", "risk", "score",
-                    "fuel", "border_fees", "leg", "ticker", "units", "buy_vwap",
+                    "fuel", "border_fees", "leg", "ticker", "category", "units", "buy_vwap",
                     "sell_vwap"])
         for r in results:
             if r.kind == "one-way":
@@ -1578,7 +1592,7 @@ def write_csv(results, path):
                     w.writerow([r.kind, r.label, round(r.hours, 2),
                                 round(r.net_profit), round(r.risk), round(r.score),
                                 round(fuel), round(r.border_fees), leg,
-                                i["ticker"], i["units"],
+                                i["ticker"], category(i["ticker"]), i["units"],
                                 round(i["buy_vwap"], 2), round(i["sell_vwap"], 2)])
 
 
@@ -1868,6 +1882,7 @@ def main(argv=None):
               + (f"Choosing STL/reactor settings per trip {fm.describe()}."
                  if settings.pick_fuel else
                  f"Fixed at {ship.settings_label} STL/reactor (--fixed-fuel)."))
+    CATEGORIES.update(client.categories())
     market = Market(books, client.materials(),
                     History(client, enabled=not args.no_history), borders, cur,
                     routes)

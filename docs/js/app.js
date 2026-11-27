@@ -214,7 +214,8 @@ async function loadData(force = false) {
       currency[e] = books.currency[e] || mk.currency[e] || E.DEFAULT_CURRENCY[e] || null;
     }
     const { routes, failed } = await fio.loadRoutes(exchanges, mk.system, mk.pcLen, (m) => status(m));
-    state.data = { books, exchanges, currency, region: mk.region, routes, failed, materials: mk.materials };
+    state.data = { books, exchanges, currency, region: mk.region, routes, failed, materials: mk.materials,
+                   categories: mk.categories || {}, names: mk.names || {} };
     state.loadedAt = Date.now();
     refreshExchangeSelects();
     updateAge();
@@ -347,11 +348,21 @@ function renderResults() {
 
 const sliders = (sh) => `${Math.round(100 * sh.stlUsage)}% / ${Math.round(100 * sh.reactorUsage)}%`;
 
+// "SI" plus its FIO category ("metals"), with the full name on hover.
+function itemCell(t) {
+  const cat = state.data?.categories?.[t] || "", name = state.data?.names?.[t] || "";
+  return `<span title="${esc(name)}"><b>${esc(t)}</b></span>${cat ? ` <span class="cat">${esc(cat)}</span>` : ""}`;
+}
+const itemText = (t) => {
+  const cat = state.data?.categories?.[t];
+  return cat ? `${esc(t)} (${esc(cat)})` : esc(t);
+};
+
 function itemTable(items, cin, cout) {
   return `<div class="table-scroll"><table class="data"><thead><tr>
     <th>Item</th><th class="n">Units</th><th class="n">Avg buy</th><th class="n">Avg sell</th>
     <th class="n">Spent ${esc(cin)}</th><th class="n">Get ${esc(cout)}</th></tr></thead><tbody>
-    ${items.map((i) => `<tr><td>${esc(i.ticker)}</td><td class="n">${fmt(i.units)}</td>
+    ${items.map((i) => `<tr><td>${itemCell(i.ticker)}</td><td class="n">${fmt(i.units)}</td>
       <td class="n">${f2(i.buy_vwap)}</td><td class="n">${f2(i.sell_vwap)}</td>
       <td class="n">${fmt(i.spent ?? i.cost)}</td><td class="n">${fmt(i.received ?? i.sales)}</td></tr>`).join("")}
     </tbody></table></div>`;
@@ -363,7 +374,7 @@ function crossingLine(c) {
 }
 
 function steps(r) {
-  const buy = (items) => items.map((i) => `${fmt(i.units)} ${esc(i.ticker)} (avg ${f2(i.buy_vwap)})`).join(", ");
+  const buy = (items) => items.map((i) => `${fmt(i.units)} ${itemText(i.ticker)} at avg ${f2(i.buy_vwap)}`).join(", ");
   const sh = r.ship || state.lastRun.ship;
   const plan = `In SFC, set the STL slider to <b>${Math.round(100 * sh.stlUsage)}%</b> and the reactor to <b>${Math.round(100 * sh.reactorUsage)}%</b>`
     + (sh.flightModel ? ` (about ${r.hours.toFixed(1)} h in all).` : ".");
@@ -510,6 +521,20 @@ function init() {
   $("#gw-add").onclick = () => { addGatewayRow(); saveSettings(); };
   $("#run").onclick = run;
   $("#refresh").onclick = () => loadData(true);
+  $("#add-trade").onsubmit = (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const v = (k) => String(fd.get(k) || "").trim();
+    const route = v("route").toUpperCase().replace(/\s*(>|→|-)\s*/g, ">");
+    if (!/^[A-Z0-9]+(>[A-Z0-9]+)+$/.test(route)) { alert("Write the route like CI1>AI1>CI1."); return; }
+    const d = Log.load();
+    Log.addManual(d, { route, kind: v("kind"), currency: v("currency").toUpperCase(),
+                       profit: Number(v("profit")), hours: v("hours") === "" ? null : Number(v("hours")),
+                       opened: v("opened") || null, closed: v("closed") || null, note: v("note") || null });
+    Log.save(d);
+    e.target.reset();
+    renderLog();
+  };
   $("#export-json").onclick = () => download("trade_log.json", JSON.stringify(Log.load(), null, 2), "application/json");
   $("#export-md").onclick = () => download("track_record.md", Log.markdown(Log.load()), "text/markdown");
   $("#import-json").onchange = async (e) => {

@@ -75,8 +75,13 @@ export class Fio {
       this.get("/exchange/station", { ttlMs: 7 * DAY, persist: true }),
       this.get("/global/simulationdata", { ttlMs: 30 * DAY, persist: true }).catch(() => ({})),
     ]);
-    const materials = {};
-    for (const m of mats) if (m.Ticker) materials[m.Ticker] = [m.Weight, m.Volume];
+    const materials = {}, categories = {}, names = {};
+    for (const m of mats) {
+      if (!m.Ticker) continue;
+      materials[m.Ticker] = [m.Weight, m.Volume];
+      categories[m.Ticker] = m.CategoryName || "";
+      names[m.Ticker] = m.Name || "";
+    }
 
     const system = {}, currency = {}, region = {};
     for (const s of Array.isArray(stations) ? stations : []) {
@@ -87,7 +92,7 @@ export class Fio {
       region[code] = String(s.CountryCode || regionFromCode(code)).toUpperCase();
     }
     const pcLen = Number(sim && sim.ParsecLength) || 12;
-    return { full, materials, system, currency, region, pcLen };
+    return { full, materials, categories, names, system, currency, region, pcLen };
   }
 
   // {"A>B": {jumps, parsecs}} for every pair of exchanges, from the game's
