@@ -157,6 +157,7 @@ Or pass one flat fee for every faction-border crossing: `--border-fee 4500`.
 | `--risk-aversion 1.0` | standard deviations of price risk subtracted from profit when ranking |
 | `--fee-rate 0.01` | exchange fee per trade |
 | `--ftl-tank 300` | FF the ship's FTL tank holds; legs needing more are skipped |
+| `--stl-tank 1500` | SF the ship's STL tank holds; trips needing more are skipped |
 | `--reactor-usage 25` | FTL reactor setting you fly at, as in SFC |
 | `--csv results.csv` | save every result |
 | `--offline` | use cached data only |

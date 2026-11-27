@@ -431,6 +431,18 @@ export function fuelUnits(ship, route, roundTrip = false) {
   return [sf, ff];
 }
 
+// Whether the tanks hold the fuel for `flights` flights of route, bought
+// before leaving. This is what limits range. Unset tank sizes aren't checked.
+export function fuelFits(ship, route, flights = 1) {
+  if (ship.stlTank && sfUnits(ship) * flights > ship.stlTank) return false;
+  if (ship.ftlTank && route.parsecs != null) {
+    const ff = ship.flightModel ? modelFF(ship.flightModel, route.parsecs, ship.reactorUsage)
+      : route.parsecs * (ship.ffPerParsec || 0) * ship.reactorUsage;
+    return ff * flights <= ship.ftlTank;
+  }
+  return true;
+}
+
 export function fuelCost(ship, books, origin, route, roundTrip = false) {
   const u = fuelUnits(ship, route, roundTrip);
   if (!u) return NaN;
@@ -478,11 +490,7 @@ function tradable(m, t, src, dst) {
 export function legInfo(routes, ship, a, b) {
   const r = routes[`${a}>${b}`];
   if (!r) return null;
-  if (ship.ftlTank && r.parsecs != null) {
-    const ff = ship.flightModel ? modelFF(ship.flightModel, r.parsecs, ship.reactorUsage)
-      : r.parsecs * (ship.ffPerParsec || 0) * ship.reactorUsage;
-    if (ff > ship.ftlTank) return null; // more FF than the tank holds
-  }
+  if (!fuelFits(ship, r)) return null; // more fuel than the tanks hold
   if (ship.flightModel) {
     if (r.parsecs == null) return null;
     return { route: r, hours: modelHours(ship.flightModel, r.parsecs, r.jumps, ship.stlUsage,
@@ -503,6 +511,7 @@ export async function evaluateRoute(origin, dest, leg, ship, s, m) {
   const crossings = back ? [out, back] : [out];
   const borderFees = crossings.reduce((t, c) => t + c.exit_fee + c.entry_fee, 0);
 
+  if (s.roundTrip && !fuelFits(ship, leg.route, 2)) return null; // can't carry fuel for both ways
   const fuel = fuelCost(ship, books, origin, leg.route, s.roundTrip);
   if (Number.isNaN(fuel)) return null;
   const goodsBudget = s.capital - fuel - out.exit_fee;
@@ -763,6 +772,7 @@ function screenSetting(res, ship, s, m) {
     const leg = legInfo(m.routes, ship, a, b);
     if (!leg) return null;
     hours += leg.hours;
+    if (s.roundTrip && oneWay && !fuelFits(ship, leg.route, 2)) return null;
     fuel.push(fuelCost(ship, m.books, a, leg.route, s.roundTrip && oneWay));
   }
   if (fuel.some(Number.isNaN)) return null;

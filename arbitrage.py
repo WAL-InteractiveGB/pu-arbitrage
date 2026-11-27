@@ -795,6 +795,7 @@ class Ship:
     stl_departure_share: float = STL_DEPARTURE_SHARE
     flight_model: FlightModel | MeasuredModel | None = None  # fitted from SFC flights
     ftl_tank: float | None = None  # FF the tank holds; longer legs are skipped
+    stl_tank: float | None = None  # SF the tank holds
 
     def ff_units(self, parsecs):
         if self.flight_model:
@@ -823,6 +824,16 @@ class Ship:
             return 0.0
         approach = STL_BURN * self.stl_usage * self.sf_loaded
         return approach * (1 + self.stl_departure_share)
+
+    def fuel_fits(self, route, flights=1):
+        """Whether the tanks hold the fuel for `flights` flights of route
+        bought before leaving. Range comes from this: a ship can only fly as
+        far as the fuel it can carry. Unset tank sizes are not checked."""
+        if self.stl_tank and self.sf_units() * flights > self.stl_tank:
+            return False
+        if self.ftl_tank and route.parsecs is not None:
+            return self.ff_units(route.parsecs) * flights <= self.ftl_tank
+        return True
 
     @property
     def has_sf(self):
@@ -1042,6 +1053,9 @@ def evaluate_route(origin, dest, leg, ship, settings, market):
     crossings = [out] + ([back] if back else [])
     border_fees = sum(c.exit_fee + c.entry_fee for c in crossings)
 
+    if settings.round_trip and not ship.fuel_fits(route, 2):
+        log(f"  {origin}>{dest}: skipped, the tanks can't hold fuel for both ways")
+        return None
     fuel = fuel_cost(ship, books, origin, route, settings.round_trip)
     if math.isnan(fuel):
         log(f"  {origin}>{dest}: skipped, not enough SF/FF on sale at {origin}")
@@ -1291,8 +1305,8 @@ def leg_info(routes, ship, a, b):
     r = routes.get((a, b))
     if r is None:
         return None
-    if ship.ftl_tank and r.parsecs is not None and ship.ff_units(r.parsecs) > ship.ftl_tank:
-        return None  # more FF than the tank holds
+    if not ship.fuel_fits(r):
+        return None  # more fuel than the tanks hold
     if r.hours is not None:
         hours = r.hours
     elif ship.flight_model:
@@ -1365,7 +1379,8 @@ def build_ship(args):
                      ("ff_per_parsec", args.ff_per_parsec),
                      ("sf_loaded", args.sf_loaded),
                      ("stl_usage", args.stl_usage),
-                     ("ftl_tank", args.ftl_tank)):
+                     ("ftl_tank", args.ftl_tank),
+                     ("stl_tank", args.stl_tank)):
         if val is not None:
             cfg[key] = val
     if not cfg["weight"] or not cfg["volume"]:
@@ -1388,7 +1403,7 @@ def build_ship(args):
                                      if cfg["stl_departure_share"] is None
                                      else cfg["stl_departure_share"]),
                 flight_model=load_flight_model(cfg["flight_model"], cfg["sf_loaded"]),
-                ftl_tank=cfg["ftl_tank"])
+                ftl_tank=cfg["ftl_tank"], stl_tank=cfg["stl_tank"])
     if ship.flight_model:
         # Start from the nearest settings the model can be trusted at.
         ship.stl_usage, ship.reactor_usage = ship.flight_model.snap(
@@ -1524,8 +1539,10 @@ def print_cycle(best, cur):
 def print_results(results, top, ship, cur=None):
     cur = cur or {}
     if not results:
-        print("\nNo profitable routes found. Try more capital, a longer range, a "
-              "different --mode, or check that distances cover this origin.")
+        print("\nNo profitable routes found. Try more capital or a different "
+              "--mode, check the tank sizes (legs needing more fuel than the "
+              "tanks hold are skipped; -v shows which), and that distances "
+              "cover this origin.")
         return
     modelled = bool(ship.flight_model)
     print(f"\n{'#':<3}{'Route':<13}{'Type':<8}"
@@ -1615,6 +1632,8 @@ def parse_args(argv=None):
     ship.add_argument("--stl-usage", type=float,
                       help="STL fuel usage slider in SFC: 50 or 0.5 "
                            f"(default {100 * DEFAULT_STL_USAGE:g}%%)")
+    ship.add_argument("--stl-tank", type=float,
+                      help="SF the STL tank holds; trips needing more are skipped")
     ship.add_argument("--ftl-tank", type=float,
                       help="FF the FTL tank holds; legs needing more are skipped")
     ship.add_argument("--sf-per-trip", type=float,
@@ -1755,8 +1774,10 @@ def screen_setting(res, ship, settings, market):
         if not leg:
             return None
         hours += leg[1]
-        fuel.append(fuel_cost(ship, market.books, a, leg[0],
-                              settings.round_trip and res.kind == "one-way"))
+        both_ways = settings.round_trip and res.kind == "one-way"
+        if both_ways and not ship.fuel_fits(leg[0], 2):
+            return None
+        fuel.append(fuel_cost(ship, market.books, a, leg[0], both_ways))
     if any(math.isnan(f) for f in fuel):
         return None
     if res.kind == "one-way":

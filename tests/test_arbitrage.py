@@ -239,6 +239,15 @@ class FallbackAndTankTests(unittest.TestCase):
         slow = A.Ship(weight=500, volume=500, reactor_usage=0.5, ftl_tank=400)
         self.assertIsNotNone(A.leg_info(routes, slow, "CI1", "AI1"))
 
+    def test_stl_tank_and_both_ways_limit_range(self):
+        route = A.Route(9, 61.4, 10.0)
+        ship = A.Ship(weight=500, volume=500, reactor_usage=0.25, ftl_tank=300,
+                      sf_per_trip=900, stl_tank=1500)
+        self.assertTrue(ship.fuel_fits(route))         # 900 SF, ~110 FF
+        self.assertFalse(ship.fuel_fits(route, 2))     # 1,800 SF > 1,500
+        self.assertFalse(A.Ship(weight=500, volume=500, sf_per_trip=900,
+                                stl_tank=800).fuel_fits(route))
+
 
 class ManualTradeTests(unittest.TestCase):
     def test_manual_trade_counts_profit_not_accuracy(self):
